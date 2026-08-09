@@ -157,7 +157,7 @@ paths:
       security: [{PattyKey: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ChatCompletion'}}}}
       responses:
-        '200': {description: 'chat.completion, or a chat.completion.chunk SSE stream when stream is true. A turn that calls tools has finish_reason tool_calls, null content and a tool_calls array; tool calls are never persisted, so they appear only on the live response.'}
+        '200': {description: 'chat.completion, or a chat.completion.chunk SSE stream when stream is true. A turn that calls tools has finish_reason tool_calls, null content and a tool_calls array; tool calls are never persisted, so they appear only on the live response. A reasoning sub''s thinking arrives as delta.reasoning_content chunks while streaming, and as message.reasoning_content when not; like the answer it is never persisted, and PATTY_FORWARD_REASONING=0 omits it.'}
         '400': {description: 'Invalid request, including a malformed response_format or an out-of-range sampling knob, or model_unavailable when tools were offered and no stacked sub serving that model supports them'}
         '502': {description: Upstream run failed or was cancelled}
         '503': {description: 'no_eligible_account: every eligible sub is busy, cooling down or out of quota. Retryable, with Retry-After.'}
@@ -187,7 +187,7 @@ paths:
                 top_p: {type: number, minimum: 0, maximum: 1}
                 seed: {type: integer}
       responses:
-        '200': {description: 'A response object whose output is a list of items (an output_text message, plus a function_call item per call), with usage in Responses names. With stream true, the named SSE events response.created, response.in_progress, response.output_item.added, response.content_part.added, response.output_text.delta, response.output_text.done, response.content_part.done, response.output_item.done and response.completed (or response.failed).'}
+        '200': {description: 'A response object whose output is a list of items (an output_text message, plus a function_call item per call), with usage in Responses names. With stream true, the named SSE events response.created, response.in_progress, response.output_item.added, response.content_part.added, response.reasoning_summary_text.delta when the sub reasons, response.output_text.delta, response.output_text.done, response.content_part.done, response.output_item.done and response.completed (or response.failed).'}
         '400': {description: 'Invalid request, including a hosted tool or a malformed text.format, or model_unavailable when tools were offered and no stacked sub serving that model supports them'}
         '502': {description: Upstream run failed or was cancelled}
         '503': {description: 'no_eligible_account: every eligible sub is busy, cooling down or out of quota. Retryable, with Retry-After.'}
@@ -227,7 +227,7 @@ paths:
   /v1/doctor: { get: { security: [{PattyKey: []}], responses: {'200': {description: 'Named checks with a detail and, when failing, a hint that names the fix'}} } }
   /v1/runs: { get: { security: [{PattyKey: []}], parameters: [{name: sub, in: query, schema: {type: string}}, {name: model, in: query, schema: {type: string}}, {name: status, in: query, schema: {type: string}}, {name: keyId, in: query, schema: {type: string}}, {name: since, in: query, schema: {type: string, format: date-time}}, {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 50}}], responses: {'200': {description: 'Run history, newest first, with sub, key, status, attempt count and tokens'}} }, post: { security: [{PattyKey: []}], requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Run'}}}}, responses: {'202': {description: Run}} } }
   /v1/runs/{id}: { get: { security: [{PattyKey: []}], parameters: [{$ref: '#/components/parameters/RunId'}], responses: {'200': {description: Run}} } }
-  /v1/runs/{id}/events: { get: { security: [{PattyKey: []}], parameters: [{$ref: '#/components/parameters/RunId'}], responses: {'200': {description: SSE}} } }
+  /v1/runs/{id}/events: { get: { security: [{PattyKey: []}], parameters: [{$ref: '#/components/parameters/RunId'}], responses: {'200': {description: 'SSE stream of PattyEvents: started, delta, reasoning, tool_calls, usage, approval_required and one terminal completed/failed/cancelled. delta, reasoning and tool_calls are provider content, so a replayed one carries the turn''s live in-process buffer while it lasts and a redacted marker afterwards.'}} } }
   /v1/runs/{id}/cancel: { post: { security: [{PattyKey: []}], parameters: [{$ref: '#/components/parameters/RunId'}], responses: {'202': {description: Cancel}} } }
   /v1/runs/{id}/tool-results:
     post:

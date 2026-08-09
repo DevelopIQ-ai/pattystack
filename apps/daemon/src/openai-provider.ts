@@ -100,9 +100,12 @@ export class OpenAiCompatibleAdapter implements ProviderAdapter {
           if (!line.startsWith('data:')) continue;
           const payload = line.slice(5).trim();
           if (payload === '[DONE]') continue;
-          const event = JSON.parse(payload) as { choices?: { delta?: { content?: string; tool_calls?: ToolCallDelta[] } }[]; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; completion_tokens_details?: { reasoning_tokens?: number } } };
+          const event = JSON.parse(payload) as { choices?: { delta?: { content?: string; reasoning_content?: unknown; reasoning?: unknown; tool_calls?: ToolCallDelta[] } }[]; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; completion_tokens_details?: { reasoning_tokens?: number } } };
           const text = event.choices?.[0]?.delta?.content;
           if (text) onEvent({ version: 1, type: 'delta', runId: turnId, data: { text } });
+          /** `reasoning_content` is what DeepSeek, vLLM and most gateways send; OpenRouter calls the same thing `reasoning`, and a provider that sends a structured value rather than text has nothing to forward. */
+          const thinking = event.choices?.[0]?.delta?.reasoning_content ?? event.choices?.[0]?.delta?.reasoning;
+          if (typeof thinking === 'string' && thinking) onEvent({ version: 1, type: 'reasoning', runId: turnId, data: { text: thinking } });
           for (const fragment of event.choices?.[0]?.delta?.tool_calls ?? []) {
             const index = fragment.index ?? 0;
             const call = calls.get(index) ?? { id: '', type: 'function' as const, function: { name: '', arguments: '' } };

@@ -527,6 +527,83 @@ describe('responses translation', () => {
   });
 });
 
+describe('reasoning traces', () => {
+  const settled = async (c: Coordinator, runId: string) => { for (let attempt = 0; attempt < 100 && !c.events(runId).some(event => event.type === 'completed'); attempt++) await new Promise(resolve => setTimeout(resolve, 1)); };
+  const thinkingAdapter = (chunks: PattyEvent['type'][] | { type: PattyEvent['type']; text?: string }[]): ProviderAdapter => ({ login: async () => ({}), cancelLogin: async () => {}, snapshot: async () => ({ models: ['gpt-5-codex'], quota: { observedAt: now() } }), createThread: async () => 'thread', run: async (_thread, _model, _input, emit) => { await wait(); for (const chunk of chunks) { const step = typeof chunk === 'string' ? { type: chunk } as { type: PattyEvent['type']; text?: string } : chunk; emit({ version: 1, type: step.type, runId: 'provider', ...(step.text === undefined ? {} : { data: { text: step.text } }) }); } return { turnId: 'provider' }; }, interrupt: async () => {}, approve: async () => {}, logout: async () => {}, health: async () => true, shutdown: async () => {} });
+  const thinking = (input = 'x', adapter?: ProviderAdapter) => { const store = new Store(); const a = account('thinker'); store.addAccount(a); const c = new Coordinator(store, new Router(store), new Map([[a.id, adapter ?? thinkingAdapter([{ type: 'reasoning', text: 'first ' }, { type: 'reasoning', text: 'second' }, { type: 'delta', text: 'answer' }, { type: 'completed' }])]])); return { store, c, run: c.start({ model: 'gpt-5-codex', input }) }; };
+
+  it('forwards reasoning live, buffers it for a late subscriber, and persists it redacted', async () => {
+    const { store, c, run } = thinking();
+    const runId = await run;
+    const seen: PattyEvent[] = [];
+    c.on(runId, event => seen.push(event));
+    await settled(c, runId);
+    expect(c.liveReasoning(runId)).toBe('first second');
+    /** A subscriber that attaches mid-turn is handed the thinking so far, which is why it is buffered rather than only streamed. */
+    expect(seen.filter(event => event.type === 'reasoning').map(event => (event.data as { text: string }).text)).toEqual(['first ', 'second']);
+    expect(c.eventItems(runId).map(item => item.event.type)).toContain('reasoning');
+    const rows = store.db.prepare("SELECT data FROM run_events WHERE run_id=? AND type='reasoning'").all(runId) as { data: string }[];
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every(row => row.data === JSON.stringify({ redacted: true }))).toBe(true);
+    expect(rows.map(row => row.data).join('')).not.toContain('first');
+  });
+
+  it('collects reasoning apart from the answer, seeding a mid-turn caller from the buffer', async () => {
+    const { c, run } = thinking();
+    const runId = await run;
+    const seeded: string[] = [];
+    await settled(c, runId);
+    const result = await c.collect(runId, undefined, 1_000, true, chunk => seeded.push(chunk));
+    expect(result.text).toBe('answer');
+    expect(result.reasoning).toBe('first second');
+    expect(seeded.join('')).toBe('first second');
+  });
+
+  /** Reasoning is the model's private working, so the operator can refuse to hand it out without giving up the answer. */
+  it('drops reasoning entirely when forwarding is switched off', async () => {
+    process.env.PATTY_FORWARD_REASONING = '0';
+    try {
+      const { c, run } = thinking();
+      const runId = await run;
+      await settled(c, runId);
+      expect(c.liveReasoning(runId)).toBeUndefined();
+      expect(c.events(runId).map(event => event.type)).not.toContain('reasoning');
+      expect((await c.collect(runId, undefined, 1_000)).reasoning).toBe('');
+      expect((await c.collect(runId, undefined, 1_000)).text).toBe('answer');
+    } finally { delete process.env.PATTY_FORWARD_REASONING; }
+  });
+
+  /** Thinking is not an answer: a sub that only thought before dying has produced nothing the caller has seen, so the turn may still move. */
+  it('does not count reasoning as started output, so a pre-answer failure still fails over', async () => {
+    const store = new Store(); const first = account('first'); const second = account('second'); store.addAccount(first); store.addAccount(second);
+    const thinksThenDies: ProviderAdapter = { ...thinkingAdapter([]), run: async (_thread, _model, _input, emit) => { emit({ version: 1, type: 'reasoning', runId: 'provider', data: { text: 'hmm' } }); throw new Error('early'); } };
+    const c = new Coordinator(store, new Router(store), new Map([[first.id, thinksThenDies], [second.id, new FakeAdapter()]]));
+    const runId = await c.start({ model: 'gpt-5-codex', input: 'x', accountId: first.id });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(store.publicRun(runId)?.status).toBe('completed');
+  });
+
+  it('forwards an upstream provider’s reasoning_content and OpenRouter’s reasoning alike', async () => {
+    const { OpenAiCompatibleAdapter } = await import('../src/openai-provider.js');
+    const stream = (chunks: string[]) => new Response(new ReadableStream({ start(controller) { for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk)); controller.close(); } }));
+    process.env.PATTY_TEST_PROVIDER_KEY = 'sk-not-a-real-key';
+    const seen: { type: string; text?: string }[] = [];
+    const adapter = new OpenAiCompatibleAdapter({ baseUrl: 'https://api.example.invalid/v1', apiKeyEnv: 'PATTY_TEST_PROVIDER_KEY', fetch: (async () => stream([
+      'data: {"choices":[{"delta":{"reasoning_content":"weighing "}}]}\n',
+      'data: {"choices":[{"delta":{"reasoning":"the options"}}]}\n',
+      'data: {"choices":[{"delta":{"reasoning":{"summary":"structured"}}}]}\n',
+      'data: {"choices":[{"delta":{"content":"hello"}}]}\n',
+      'data: [DONE]\n',
+    ])) as unknown as typeof fetch });
+    await adapter.run(undefined, 'm', 'hi', event => seen.push({ type: event.type, text: (event.data as { text?: string } | undefined)?.text }));
+    for (let attempt = 0; attempt < 50 && !seen.some(event => event.type === 'completed'); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    expect(seen.map(event => event.type)).toEqual(['reasoning', 'reasoning', 'delta', 'completed']);
+    expect(seen.filter(event => event.type === 'reasoning').map(event => event.text).join('')).toBe('weighing the options');
+    expect(seen.find(event => event.type === 'delta')?.text).toBe('hello');
+    delete process.env.PATTY_TEST_PROVIDER_KEY;
+  });
+});
+
 describe('credential leases', () => {
   it('holds one of the sub\'s run slots for as long as the loan lives', () => { const store = new Store(); const a = account('a'); store.addAccount(a); const lease = store.openCredentialLease(a.id, 60_000, 'puffle'); expect(lease).toMatchObject({ accountId: a.id, alias: 'a', holder: 'puffle', models: ['gpt-5-codex'] }); expect(store.account(a.id)?.activeRuns).toBe(1); expect(eligible(store.account(a.id)!, { model: 'gpt-5-codex', input: '' })).toBe(true); store.openCredentialLease(a.id, 60_000); expect(store.account(a.id)?.activeRuns).toBe(2); expect(eligible(store.account(a.id)!, { model: 'gpt-5-codex', input: '' })).toBe(false); expect(() => store.openCredentialLease(a.id, 60_000)).toThrow('no_eligible_account'); });
   it('gives the sub back on release and on expiry, so a holder that dies cannot pin it', () => { const store = new Store(); const a = account('a'); store.addAccount(a); const kept = store.openCredentialLease(a.id, 60_000); const abandoned = store.openCredentialLease(a.id, 60_000); expect(store.releaseCredentialLease(kept.id)).toBe(true); expect(store.releaseCredentialLease(kept.id)).toBe(false); expect(store.account(a.id)?.activeRuns).toBe(1); store.db.prepare('UPDATE credential_leases SET expires_at=? WHERE id=?').run('2000-01-01T00:00:00.000Z', abandoned.id); expect(store.credentialLease(abandoned.id)).toBeUndefined(); expect(store.credentialLeases()).toEqual([]); expect(store.account(a.id)?.activeRuns).toBe(0); });

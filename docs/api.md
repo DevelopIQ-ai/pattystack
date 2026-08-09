@@ -53,6 +53,17 @@ The app-server protocol has no way to hand a subscription turn the caller's func
 5. The caller runs the function and sends the result back the way an OpenAI client already does — a `tool` message carrying the `tool_call_id`, in the next `POST /v1/chat/completions`. Patty matches that id to the parked turn and resumes it rather than starting a new one, so the sub keeps everything it had already worked out. The response reports the same run id as the first half of the round trip. The transcript in the follow-up request is ignored for a resumed turn: the sub is still holding the conversation.
 6. A caller that never comes back is not held forever — the parked call times out (`PATTY_TOOL_RESULT_TIMEOUT_MS`, five minutes by default) and the turn fails rather than pinning the sub. An id Patty no longer holds is not resumable, and the request is served as a fresh turn instead.
 
+### Reasoning traces
+
+A reasoning model's thinking is forwarded as its own kind of event rather than folded into the answer or reduced to the `reasoningOutputTokens` counter, so a client that renders a thinking block has something to render:
+
+- **The native contract** gains `PattyEvent` `type: "reasoning"` with `data: {text}`, carried exactly as `delta` is. It is additive: a consumer that switches on the older types ignores it and behaves as before.
+- **`POST /v1/chat/completions`** streams it as `choices[0].delta.reasoning_content` chunks — the shape DeepSeek, vLLM and OpenRouter already emit — in their own chunks, never mixed into a chunk carrying `content`. A non-streaming answer carries the whole trace on the message as `reasoning_content`, present only when the sub produced one.
+- **`POST /v1/responses`** streams it as `response.reasoning_summary_text.delta` (`item_id`, `output_index`, `summary_index`, `delta`).
+- **Where it comes from.** A Codex subscription's `item/reasoning/textDelta` and `item/reasoning/summaryTextDelta` notifications become reasoning events, and `item/reasoning/summaryPartAdded` becomes the blank line between summary sections. An OpenAI-compatible sub's `delta.reasoning_content` or `delta.reasoning` does the same, whichever the provider sends.
+- **What is stored is nothing.** Reasoning is provider content, so `run_events` records that a `reasoning` event happened and nothing about it, exactly as for `delta`. It never reaches the request log, the run receipt or the console. Late replay reads the turn's live in-process buffer (64 KiB, dropped 60s after the run is terminal) and falls back to the redacted marker once that is gone.
+- **`PATTY_FORWARD_REASONING=0`** drops reasoning at the coordinator: no event is emitted, buffered or persisted, and no surface mentions it. Forwarding is on by default because a trace the operator's own model produced for the operator's own client is what makes a thinking block possible, and the default costs nothing that was not already streamed.
+
 ### Responses API
 
 `POST /v1/responses` is the same engine as `/v1/chat/completions` with the Responses request and answer shapes, because a current OpenAI SDK or Vercel AI SDK client reaches for that path by default and a stack that only speaks chat completions is unreachable to it.
@@ -144,7 +155,7 @@ The longest matching model prefix wins, so `gpt-5-codex-2026-01-01` inherits `gp
 
 ## Streaming privacy
 
-Live SSE subscribers receive normalized provider deltas while connected. Patty persists only event ordering/type metadata for `delta` and approval events; it does not persist provider output content. Late SSE replay therefore provides redacted delta markers and terminal semantics, not prior generated text.
+Live SSE subscribers receive normalized provider deltas while connected. Patty persists only event ordering/type metadata for `delta`, `reasoning` and approval events; it does not persist provider output content. Late SSE replay therefore provides redacted delta markers and terminal semantics, not prior generated text — except while the turn's live in-process buffers survive, which is what lets a subscriber that joins mid-turn read the text and reasoning so far.
 
 ## Observability
 
