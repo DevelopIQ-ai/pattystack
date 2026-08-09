@@ -909,3 +909,76 @@ describe('lending a subscription to a caller that drives Codex itself', () => {
     expect(dump).not.toContain('fake-chatgpt-account');
   });
 });
+
+describe('reasoning traces on the OpenAI-compatible surface', () => {
+  /** The reasoning notifications a real upstream sends: two thinking fragments, then the answer. */
+  const thinkingUpstream = (): typeof fetch => (async (input: string | URL | Request) => new URL(String(input)).pathname.endsWith('/models')
+    ? new Response(JSON.stringify({ data: [{ id: 'deepseek-reasoner' }] }), { headers: { 'content-type': 'application/json' } })
+    : new Response(new ReadableStream({ start(controller) { for (const chunk of [
+      'data: {"choices":[{"delta":{"reasoning_content":"the user said hi. "}}]}\n',
+      'data: {"choices":[{"delta":{"reasoning_content":"i will greet them."}}]}\n',
+      'data: {"choices":[{"delta":{"content":"hello!"}}]}\n',
+      'data: {"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10,"completion_tokens_details":{"reasoning_tokens":5}}}\n',
+      'data: [DONE]\n',
+    ]) controller.enqueue(new TextEncoder().encode(chunk)); controller.close(); } }))) as unknown as typeof fetch;
+  const boot = async () => { const daemon = new PattyDaemon(); process.env.PATTY_TEST_PROVIDER_KEY = 'sk-not-a-real-key'; await daemon.addOpenAiCompatibleAccount('reasoner', 'https://api.example.invalid/v1', 'PATTY_TEST_PROVIDER_KEY', thinkingUpstream()); server = await daemon.listen(); return { daemon, port: (server.address() as { port: number }).port, headers: { authorization: `Bearer ${daemon.key}`, 'content-type': 'application/json' } }; };
+  const chunksOf = (payload: string) => payload.split('\n\n').filter(frame => frame.startsWith('data: ')).map(frame => frame.slice(6)).filter(chunk => chunk !== '[DONE]').map(chunk => JSON.parse(chunk) as { choices: { delta: { content?: string; reasoning_content?: string } }[] });
+
+  it('streams reasoning_content deltas beside the answer’s content deltas', async () => {
+    const { port, headers } = await boot();
+    const payload = await (await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: 'deepseek-reasoner', messages: [{ role: 'user', content: 'hi' }], stream: true }) })).text();
+    const chunks = chunksOf(payload);
+    expect(chunks.map(chunk => chunk.choices[0]?.delta.reasoning_content ?? '').join('')).toBe('the user said hi. i will greet them.');
+    /** Thinking is not the answer: a client that only reads `content` sees exactly what it saw before. */
+    expect(chunks.map(chunk => chunk.choices[0]?.delta.content ?? '').join('')).toBe('hello!');
+    expect(chunks.filter(chunk => chunk.choices[0]?.delta.reasoning_content !== undefined).every(chunk => chunk.choices[0]?.delta.content === undefined)).toBe(true);
+    delete process.env.PATTY_TEST_PROVIDER_KEY;
+  });
+
+  it('carries the accumulated reasoning on a non-streaming message and persists it redacted', async () => {
+    const { daemon, port, headers } = await boot();
+    const body = await (await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: 'deepseek-reasoner', messages: [{ role: 'user', content: 'hi' }] }) })).json() as { choices: { message: { content: string; reasoning_content?: string } }[]; usage: { completion_tokens_details: { reasoning_tokens: number } } };
+    expect(body.choices[0]!.message).toEqual({ role: 'assistant', content: 'hello!', reasoning_content: 'the user said hi. i will greet them.' });
+    expect(body.usage.completion_tokens_details.reasoning_tokens).toBe(5);
+    const rows = daemon.store.db.prepare("SELECT data FROM run_events WHERE type='reasoning'").all() as { data: string }[];
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every(row => row.data === JSON.stringify({ redacted: true }))).toBe(true);
+    const dump = (daemon.store.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map(table => JSON.stringify(daemon.store.db.prepare(`SELECT * FROM ${table.name}`).all())).join('');
+    expect(dump).not.toContain('i will greet them');
+    delete process.env.PATTY_TEST_PROVIDER_KEY;
+  });
+
+  it('replays the reasoning so far to a subscriber that joins mid-turn', async () => {
+    const { port, headers } = await boot();
+    const { id } = await (await fetch(`http://127.0.0.1:${port}/v1/runs`, { method: 'POST', headers, body: JSON.stringify({ model: 'deepseek-reasoner', input: 'hi' }) })).json() as { id: string };
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const frames = (await (await fetch(`http://127.0.0.1:${port}/v1/runs/${id}/events`, { headers })).text()).split('\n\n').map(frame => frame.split('\n').find(line => line.startsWith('data: '))).filter(Boolean).map(line => JSON.parse(line!.slice(6)) as { type: string; data?: { text?: string } });
+    const reasoning = frames.filter(frame => frame.type === 'reasoning');
+    expect(reasoning).toHaveLength(1);
+    expect(reasoning[0]!.data?.text).toBe('the user said hi. i will greet them.');
+    expect(frames.filter(frame => frame.type === 'delta').map(frame => frame.data?.text)).toEqual(['hello!']);
+    delete process.env.PATTY_TEST_PROVIDER_KEY;
+  });
+
+  it('streams a reasoning summary delta on the Responses surface', async () => {
+    const { port, headers } = await boot();
+    const raw = await (await fetch(`http://127.0.0.1:${port}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'deepseek-reasoner', input: 'hi', stream: true }) })).text();
+    const frames = raw.split('\n\n').filter(Boolean).map(frame => ({ event: frame.split('\n')[0]!.slice(7), data: JSON.parse(frame.split('\n')[1]!.slice(6)) as { delta?: string; summary_index?: number; item_id?: string } }));
+    expect(frames.filter(frame => frame.event === 'response.reasoning_summary_text.delta').map(frame => frame.data.delta).join('')).toBe('the user said hi. i will greet them.');
+    expect(frames.find(frame => frame.event === 'response.reasoning_summary_text.delta')?.data).toMatchObject({ summary_index: 0, output_index: 0 });
+    expect(frames.find(frame => frame.event === 'response.output_text.delta')?.data.delta).toBe('hello!');
+    expect(frames.at(-1)!.event).toBe('response.completed');
+    delete process.env.PATTY_TEST_PROVIDER_KEY;
+  });
+
+  it('says nothing about reasoning on any surface when forwarding is switched off', async () => {
+    process.env.PATTY_FORWARD_REASONING = '0';
+    try {
+      const { daemon, port, headers } = await boot();
+      const payload = await (await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: 'deepseek-reasoner', messages: [{ role: 'user', content: 'hi' }], stream: true }) })).text();
+      expect(payload).not.toContain('reasoning_content');
+      expect(chunksOf(payload).map(chunk => chunk.choices[0]?.delta.content ?? '').join('')).toBe('hello!');
+      expect(daemon.store.db.prepare("SELECT COUNT(*) AS n FROM run_events WHERE type='reasoning'").get()).toMatchObject({ n: 0 });
+    } finally { delete process.env.PATTY_FORWARD_REASONING; delete process.env.PATTY_TEST_PROVIDER_KEY; }
+  });
+});

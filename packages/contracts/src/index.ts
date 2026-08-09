@@ -37,7 +37,13 @@ export type TurnSampling = { temperature?: number; topP?: number; maxOutputToken
  */
 export type TurnOptions = { responseFormat?: ChatResponseFormat; instructions?: string; reasoningEffort?: string; sampling?: TurnSampling };
 export type RunRequest = { model: string; input: string; capabilities?: string[]; accountId?: string; idempotencyKey?: string; threadId?: string; chat?: ChatTurn } & TurnOptions;
-export type PattyEvent = { version: 1; type: 'started' | 'delta' | 'tool_calls' | 'usage' | 'approval_required' | 'completed' | 'failed' | 'cancelled'; runId: string; data?: unknown };
+/**
+ * `reasoning` carries the model's thinking the way `delta` carries its answer (`{text}`), as a
+ * separate type so a client that renders a thinking block gets it without it being mistaken for the
+ * answer, and a client that only knows the older types ignores it. Like `delta` it is provider
+ * content: forwarded live, never persisted.
+ */
+export type PattyEvent = { version: 1; type: 'started' | 'delta' | 'reasoning' | 'tool_calls' | 'usage' | 'approval_required' | 'completed' | 'failed' | 'cancelled'; runId: string; data?: unknown };
 /** Provider-reported token counts for a single turn. Counts are metadata, never generated content. */
 export type TokenUsage = { inputTokens: number; cachedInputTokens: number; outputTokens: number; reasoningOutputTokens: number; totalTokens: number };
 /**

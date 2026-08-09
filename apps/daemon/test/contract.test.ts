@@ -89,6 +89,50 @@ describe('token usage telemetry', () => {
   it('maps official thread token usage notifications onto usage events', async () => { const source = fixtureSource.replace("out({jsonrpc:'2.0',id:99,method:'item/commandExecution/requestApproval'", `out({jsonrpc:'2.0',method:'thread/tokenUsage/updated',params:${JSON.stringify(officialTokenUsageNotification)}});out({jsonrpc:'2.0',id:99,method:'item/commandExecution/requestApproval'`); const { dir, command } = await fixture(source); const adapter = new CodexAppServerAdapter(command, [], dir, '0.145.0'); await adapter.start(); const events: { type: string; data?: unknown }[] = []; await adapter.run(undefined, 'gpt-5-codex', 'x', event => events.push({ type: event.type, data: event.data })); await new Promise(resolve => setTimeout(resolve, 10)); await adapter.approve('99', false); const Ajv = (await import('ajv')).default as unknown as new (options: { strict: boolean; validateFormats: boolean }) => { compile: (schema: object) => (data: unknown) => boolean }; expect(new Ajv({ strict: false, validateFormats: false }).compile(await canonicalSchema('ThreadTokenUsageUpdatedNotification'))(officialTokenUsageNotification)).toBe(true); expect(events.map(event => event.type)).toEqual(['started', 'delta', 'usage', 'approval_required', 'completed']); expect(events.find(event => event.type === 'usage')?.data).toEqual({ inputTokens: 120, cachedInputTokens: 20, outputTokens: 45, reasoningOutputTokens: 5, totalTokens: 165 }); await adapter.shutdown(); });
 });
 
+const officialReasoningSummaryDelta = { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-3', summaryIndex: 0, delta: 'weighing ' };
+const officialReasoningSummaryPart = { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-3', summaryIndex: 1 };
+const officialReasoningTextDelta = { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-3', contentIndex: 0, delta: 'the options' };
+
+describe('reasoning traces', () => {
+  it('maps official reasoning notifications onto reasoning events, section break included', async () => {
+    const source = fixtureSource.replace("out({jsonrpc:'2.0',method:'item/agentMessage/delta',params:delta});", [
+      `out({jsonrpc:'2.0',method:'item/reasoning/summaryTextDelta',params:${JSON.stringify(officialReasoningSummaryDelta)}});`,
+      `out({jsonrpc:'2.0',method:'item/reasoning/summaryPartAdded',params:${JSON.stringify(officialReasoningSummaryPart)}});`,
+      `out({jsonrpc:'2.0',method:'item/reasoning/textDelta',params:${JSON.stringify(officialReasoningTextDelta)}});`,
+      "out({jsonrpc:'2.0',method:'item/agentMessage/delta',params:delta});",
+    ].join(''));
+    expect(source).not.toBe(fixtureSource);
+    const { dir, command } = await fixture(source);
+    const adapter = new CodexAppServerAdapter(command, [], dir, '0.145.0');
+    await adapter.start();
+    const events: { type: string; data?: unknown }[] = [];
+    await adapter.run(undefined, 'gpt-5-codex', 'x', event => events.push({ type: event.type, data: event.data }));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    await adapter.approve('99', false);
+    const Ajv = (await import('ajv')).default as unknown as new (options: { strict: boolean; validateFormats: boolean }) => { compile: (schema: object) => (data: unknown) => boolean };
+    const ajv = new Ajv({ strict: false, validateFormats: false });
+    for (let attempt = 0; attempt < 50 && !events.some(event => event.type === 'completed'); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    for (const [name, value] of [['ReasoningSummaryTextDeltaNotification', officialReasoningSummaryDelta], ['ReasoningSummaryPartAddedNotification', officialReasoningSummaryPart], ['ReasoningTextDeltaNotification', officialReasoningTextDelta]] as const) expect(ajv.compile(await canonicalSchema(name))(value), name).toBe(true);
+    expect(events.map(event => event.type)).toEqual(['started', 'reasoning', 'reasoning', 'reasoning', 'delta', 'approval_required', 'completed']);
+    expect(events.filter(event => event.type === 'reasoning').map(event => (event.data as { text: string }).text).join('')).toBe('weighing \n\nthe options');
+    await adapter.shutdown();
+  });
+  /** The part that opens the stream is not a break in it, so it carries nothing rather than an empty line before the first word. */
+  it('says nothing for the reasoning summary part that opens the stream', async () => {
+    const source = fixtureSource.replace("out({jsonrpc:'2.0',method:'item/agentMessage/delta',params:delta});", `out({jsonrpc:'2.0',method:'item/reasoning/summaryPartAdded',params:${JSON.stringify({ ...officialReasoningSummaryPart, summaryIndex: 0 })}});out({jsonrpc:'2.0',method:'item/agentMessage/delta',params:delta});`);
+    const { dir, command } = await fixture(source);
+    const adapter = new CodexAppServerAdapter(command, [], dir, '0.145.0');
+    await adapter.start();
+    const events: string[] = [];
+    await adapter.run(undefined, 'gpt-5-codex', 'x', event => events.push(event.type));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    await adapter.approve('99', false);
+    for (let attempt = 0; attempt < 50 && !events.includes('completed'); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    expect(events).toEqual(['started', 'delta', 'approval_required', 'completed']);
+    await adapter.shutdown();
+  });
+});
+
 describe('account readiness', () => {
   /** A real signed-in 0.145.0 ChatGPT account reports requiresOpenaiAuth:true, so readiness must key off the account object alone. */
   it('treats a populated account as ready even when requiresOpenaiAuth is set', async () => { const source = fixtureSource.replace('"requiresOpenaiAuth":false', '"requiresOpenaiAuth":true'); expect(source).not.toBe(fixtureSource); const { dir, command } = await fixture(source); const adapter = new CodexAppServerAdapter(command, [], dir, '0.145.0'); await adapter.start(); await expect(adapter.waitForAccount(1_000)).resolves.toMatchObject({ requiresOpenaiAuth: true }); expect((await adapter.snapshot()).models).toEqual(['gpt-5-codex']); await adapter.shutdown(); });
