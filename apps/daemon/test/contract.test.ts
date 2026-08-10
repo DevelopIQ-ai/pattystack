@@ -1,10 +1,11 @@
-import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import { CodexAppServerAdapter } from '../src/codex.js';
 import { ToolBridge } from '../src/tool-bridge.js';
+import { PattyDaemon } from '../src/server.js';
 
 type Request = { id?: string | number; method?: string; params?: unknown; result?: unknown; error?: { code?: number } };
 const officialThread = { id: 'thread-1', sessionId: 'session-1', preview: '', ephemeral: true, modelProvider: 'openai', createdAt: 1, updatedAt: 1, status: { type: 'idle' }, cwd: '/tmp', cliVersion: '0.145.0', source: 'unknown', turns: [] };
@@ -167,4 +168,34 @@ describe('lending a subscription credential', () => {
     expect(new Ajv({ strict: false, validateFormats: false }).compile(await schema('GetAccountParams'))(read.params)).toBe(true);
     await adapter.shutdown(); });
   it('refuses to lend a sub logged in with an API key', async () => { const { dir, command } = await fixture(); await writeFile(join(dir, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'sk-not-a-real-key', auth_mode: 'apikey', tokens: null })); const adapter = new CodexAppServerAdapter(command, [], dir, '0.145.0'); await adapter.start(); await expect(adapter.credential()).rejects.toThrow('credential_unavailable'); await adapter.shutdown(); });
+});
+
+describe('re-authenticating a stored sub', () => {
+  /**
+   * The state a revoked ChatGPT login leaves behind: the alias, its history and its isolated home
+   * are intact and only the credential inside them is dead, so stacking the sub again is refused as
+   * a duplicate and the operator has no way back in through Patty.
+   */
+  it('drives the existing home through login again instead of refusing the alias', async () => {
+    const { dir, command } = await fixture();
+    const savedCommand = process.env.PATTY_CODEX_COMMAND, savedRoot = process.env.PATTY_ACCOUNT_HOME_ROOT;
+    process.env.PATTY_CODEX_COMMAND = command;
+    process.env.PATTY_ACCOUNT_HOME_ROOT = await mkdtemp(join(tmpdir(), 'patty-homes-'));
+    try {
+      const daemon = new PattyDaemon();
+      const added = await daemon.addCodexAccount('sub-a', 'device_code');
+      await expect(daemon.addCodexAccount('sub-a', 'device_code')).rejects.toThrow('invalid_request');
+      const relogin = await daemon.reloginCodexAccount('sub-a', 'device_code');
+      expect(relogin).toMatchObject({ id: added.id, alias: 'sub-a', code: 'CODE' });
+      expect(daemon.store.account(added.id)?.state).toBe('pending_login');
+      /** Re-login is the same sub, so its home, id and run history all survive it. */
+      expect(daemon.homes.get(added.id)).toBe(daemon.homes.get(relogin.id));
+      await expect(daemon.reloginCodexAccount('sub-b', 'device_code')).rejects.toThrow('invalid_request');
+      await daemon.coordinator.shutdown();
+    } finally {
+      savedCommand === undefined ? delete process.env.PATTY_CODEX_COMMAND : process.env.PATTY_CODEX_COMMAND = savedCommand;
+      savedRoot === undefined ? delete process.env.PATTY_ACCOUNT_HOME_ROOT : process.env.PATTY_ACCOUNT_HOME_ROOT = savedRoot;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
