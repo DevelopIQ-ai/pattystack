@@ -343,6 +343,26 @@ describe('observability', () => {
     expect(ready.data.checks.map(check => check.check)).toEqual(['subs_stacked', 'subs_servable', 'models_discovered', 'codex_cli', 'active_keys', 'store_writable']);
     expect(ready.data.checks.find(check => check.check === 'codex_cli')).toMatchObject({ ok: false });
     expect(ready.data.checks.filter(check => check.hint !== undefined).map(check => check.check)).toEqual(['codex_cli']);
+    server.close();
+
+    /**
+     * The failure a stuck operator cannot otherwise see: the CLI is installed and the logins are
+     * intact, but the version on the box speaks a protocol Patty does not, so every Codex sub is
+     * dead. That is ill health, unlike no CLI at all.
+     */
+    const upgraded = new PattyDaemon();
+    upgraded.addFakeAccount('healthy', ['gpt-5-codex']);
+    server = await upgraded.listen();
+    port = (server.address() as { port: number }).port;
+    const unspeakable = join(await mkdtemp(join(tmpdir(), 'patty-codex-')), 'codex');
+    await writeFile(unspeakable, '#!/bin/sh\necho codex-cli 0.148.0\n');
+    await chmod(unspeakable, 0o700);
+    process.env.PATTY_CODEX_COMMAND = unspeakable;
+    const drifted = await read(upgraded, port);
+    savedCommand === undefined ? delete process.env.PATTY_CODEX_COMMAND : process.env.PATTY_CODEX_COMMAND = savedCommand;
+    expect(drifted.data.ok).toBe(false);
+    expect(drifted.data.checks.find(check => check.check === 'codex_cli')).toMatchObject({ ok: false, detail: expect.stringContaining('0.148.0') });
+    expect(drifted.data.checks.find(check => check.check === 'codex_cli')?.hint).toContain('PATTY_CODEX_VERSION');
   });
 });
 

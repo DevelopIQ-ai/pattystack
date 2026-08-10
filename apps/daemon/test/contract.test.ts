@@ -77,7 +77,23 @@ describe('official 0.145.0 app-server contract', () => {
   it('rejects initialize home mismatch and cleans up the child', async () => { const source = fixtureSource.replace('codexHome:process.env.CODEX_HOME', "codexHome:'/tmp'"); const { dir, command } = await fixture(source); const adapter = new CodexAppServerAdapter(command, [], dir, '0.145.0'); await expect(adapter.start()).rejects.toThrow('protocol_incompatible'); await reapedChild(dir); });
   it('classifies a nonexistent initialize home as protocol incompatible and cleans up', async () => { const source = fixtureSource.replace('codexHome:process.env.CODEX_HOME', "codexHome:'/definitely/missing-codex-home'"); const { dir, command } = await fixture(source); const adapter = new CodexAppServerAdapter(command, [], dir, '0.145.0'); await expect(adapter.start()).rejects.toThrow('protocol_incompatible'); await reapedChild(dir); });
   it('cleans up the child after initialize timeout', async () => { const source = fixtureSource.replace("if(r.method==='initialize'){out(", "if(r.method==='initialize'){return}if(false){out("); const { dir, command } = await fixture(source); const adapter = new CodexAppServerAdapter(command, [], dir, '0.145.0', 20); await expect(adapter.start()).rejects.toThrow('rpc timeout'); await reapedChild(dir); });
-  it('rejects a command that is not the pinned official version', async () => { const { dir, command } = await fixture(); await writeFile(command, '#!/bin/sh\necho codex-cli 0.144.0\n'); await chmod(command, 0o700); await expect(new CodexAppServerAdapter(command, [], dir, '0.145.0').start()).rejects.toThrow('protocol_incompatible'); });
+  it('rejects a command older than the supported baseline', async () => { const { dir, command } = await fixture(); await writeFile(command, '#!/bin/sh\necho codex-cli 0.144.0\n'); await chmod(command, 0o700); await expect(new CodexAppServerAdapter(command, [], dir, '0.145.0').start()).rejects.toThrow('protocol_incompatible'); });
+  /** The outage this range exists to prevent: a routine `codex upgrade` inside the range must not strand every logged-in sub in reconnect_required. */
+  it('starts on a newer release inside the supported range and refuses one beyond it', async () => {
+    const inside = await fixture(fixtureSource.replace('codex-cli 0.145.0', 'codex-cli 0.147.0'));
+    const adapter = new CodexAppServerAdapter(inside.command, [], inside.dir, '0.145.0');
+    await adapter.start();
+    await adapter.shutdown();
+    const beyond = await fixture(fixtureSource.replace('codex-cli 0.145.0', 'codex-cli 0.148.0'));
+    await expect(new CodexAppServerAdapter(beyond.command, [], beyond.dir, '0.145.0').start()).rejects.toThrow('protocol_incompatible');
+  });
+  it('starts on a version the operator vouched for beyond the range', async () => {
+    const { dir, command } = await fixture(fixtureSource.replace('codex-cli 0.145.0', 'codex-cli 0.148.0'));
+    const saved = process.env.PATTY_CODEX_VERSION;
+    process.env.PATTY_CODEX_VERSION = '0.148.0';
+    const adapter = new CodexAppServerAdapter(command, [], dir, '0.145.0');
+    try { await adapter.start(); await adapter.shutdown(); } finally { saved === undefined ? delete process.env.PATTY_CODEX_VERSION : process.env.PATTY_CODEX_VERSION = saved; }
+  });
 });
 
 const officialTokenUsageBreakdown = { cachedInputTokens: 20, cacheWriteInputTokens: 0, inputTokens: 120, outputTokens: 45, reasoningOutputTokens: 5, totalTokens: 165 };

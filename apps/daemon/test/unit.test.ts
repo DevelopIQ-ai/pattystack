@@ -8,7 +8,7 @@ import { loadAliases, resolveModel } from '../src/aliases.js';
 import { responsesBody, responsesToChat } from '../src/responses.js';
 import { Coordinator, FakeAdapter, KeyLimiter, RateLimited, Router, Store, cacheHitRate, effectiveQuota, eligible, id, now, quotaExhausted, resetUrgency, score } from '../src/core.js';
 import { estimateCost, loadPrices } from '../src/pricing.js';
-import { bridgePreamble, codexOutputSchema } from '../src/codex.js';
+import { SUPPORTED_CODEX_VERSIONS, bridgePreamble, codexOutputSchema, codexVersionSupported } from '../src/codex.js';
 import { writeFileSync } from 'node:fs';
 import { PattyDaemon, leaseTtlMs, parseReasoningEffort, parseResponseFormat, parseSampling, splitConversation } from '../src/server.js';
 const account = (id: string, remaining = 1, tier: Account['tier'] = 'primary'): Account => ({ id, alias: id, tier, state: 'ready', models: ['gpt-5-codex'], quota: { remaining, observedAt: now() }, health: 1, activeRuns: 0 });
@@ -471,6 +471,23 @@ describe('tool bridge', () => {
     const session = bridge.open(tools, () => undefined);
     await expect(bridge.call(session.token, 'get_weather', {})).rejects.toThrow('tool_result_timeout');
     session.close();
+  });
+});
+
+describe('supported Codex versions', () => {
+  it('accepts the baseline and later releases below the ceiling, and nothing outside it', () => {
+    expect(codexVersionSupported(`codex-cli ${SUPPORTED_CODEX_VERSIONS.min}`, undefined)).toBe(true);
+    expect(codexVersionSupported('codex-cli 0.146.1', undefined)).toBe(true);
+    expect(codexVersionSupported('codex-cli 0.147.0\n', undefined)).toBe(true);
+    expect(codexVersionSupported('codex-cli 0.144.9', undefined)).toBe(false);
+    expect(codexVersionSupported(`codex-cli ${SUPPORTED_CODEX_VERSIONS.below}`, undefined)).toBe(false);
+  });
+
+  it('reads only an official Codex CLI, and takes the operator\u2019s word for one exact release', () => {
+    expect(codexVersionSupported('0.147.0', undefined)).toBe(false);
+    expect(codexVersionSupported('codex-cli 0.148.0-alpha.6', undefined)).toBe(false);
+    expect(codexVersionSupported('codex-cli 0.148.0', '0.148.0')).toBe(true);
+    expect(codexVersionSupported('codex-cli 0.149.0', '0.148.0')).toBe(false);
   });
 });
 
