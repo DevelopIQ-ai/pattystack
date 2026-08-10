@@ -42,15 +42,42 @@ const approvalMethods = new Set(['item/commandExecution/requestApproval', 'item/
 export const codexOutputSchema = (format: ChatResponseFormat | undefined) =>
   format?.type === 'json_schema' ? format.json_schema.schema : format?.type === 'json_object' ? { type: 'object' } : undefined;
 
-/** Official Codex CLI 0.145.0 app-server JSONL adapter. */
+/**
+ * The app-server protocol Patty speaks — the `initialize` handshake, `thread/start`, `turn/start`,
+ * `model/list`, `account/*` — has held across Codex releases, so a supported *range* replaces an
+ * exact pin: a routine `codex upgrade` must not take every stacked subscription offline at once.
+ * A release beyond the range is refused rather than guessed at, and `PATTY_CODEX_VERSION` names one
+ * the operator has verified themselves.
+ */
+export const SUPPORTED_CODEX_VERSIONS = { min: '0.145.0', below: '0.148.0' } as const;
+export const supportedCodexVersions = () => {
+  const named = process.env.PATTY_CODEX_VERSION?.trim();
+  return `Codex >=${SUPPORTED_CODEX_VERSIONS.min} <${SUPPORTED_CODEX_VERSIONS.below}${named ? ` or exactly ${named}` : ''}`;
+};
+/** `codex --version` prints `codex-cli <version>`; anything else is not a Codex CLI. */
+export const codexVersionOf = (output: string) => /^codex-cli (\d+\.\d+\.\d+)$/.exec(output.trim())?.[1];
+const compare = (left: string, right: string) => {
+  const [a, b] = [left.split('.').map(Number), right.split('.').map(Number)];
+  for (let index = 0; index < 3; index += 1) if (a[index] !== b[index]) return a[index]! - b[index]!;
+  return 0;
+};
+/** A release the adapter is known to speak, or the exact one the operator vouched for. */
+export function codexVersionSupported(output: string, named = process.env.PATTY_CODEX_VERSION?.trim()) {
+  const version = codexVersionOf(output);
+  if (!version) return false;
+  if (named && version === named) return true;
+  return compare(version, SUPPORTED_CODEX_VERSIONS.min) >= 0 && compare(version, SUPPORTED_CODEX_VERSIONS.below) < 0;
+}
+
+/** Official Codex CLI app-server JSONL adapter. */
 export class CodexAppServerAdapter extends EventEmitter implements ProviderAdapter {
   private child?: ChildProcessWithoutNullStreams; private next = 0; private stopping = false;
   private readonly pending = new Map<number, Pending>(); private readonly turns = new Map<string, TurnRef>(); private readonly bridged = new Map<string, ToolBridgeSession>(); private readonly earlyEvents = new Map<string, QueuedTurnMessage[]>(); private readonly earlyApprovalsByThread = new Map<string, Approval[]>(); private readonly approvals = new Map<string, Approval>(); private loginId?: string;
-  constructor(private readonly command: string, private readonly args: string[], private readonly home: string, private readonly expectedVersion: string, private readonly rpcTimeoutMs = 30_000, private readonly bridge?: ToolBridge) { super(); if (expectedVersion !== '0.145.0') throw new Error('a pinned Codex 0.145.0 version is required'); }
+  constructor(private readonly command: string, private readonly args: string[], private readonly home: string, private readonly expectedVersion: string, private readonly rpcTimeoutMs = 30_000, private readonly bridge?: ToolBridge) { super(); if (expectedVersion !== SUPPORTED_CODEX_VERSIONS.min) throw new Error(`a supported Codex baseline of ${SUPPORTED_CODEX_VERSIONS.min} is required`); }
   async start() {
     if (this.child) return;
     let version: string; try { version = execFileSync(this.command, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { throw new Error('protocol_incompatible: Codex version could not be verified'); }
-    if (version !== `codex-cli ${this.expectedVersion}`) throw new Error(`protocol_incompatible: expected Codex ${this.expectedVersion}`);
+    if (!codexVersionSupported(version)) throw new Error(`protocol_incompatible: ${supportedCodexVersions()} required, found ${version}`);
     const expectedHome = realpathSync(this.home);
     const child = spawn(this.command, this.args, { env: { ...process.env, CODEX_HOME: expectedHome }, stdio: 'pipe' }); this.child = child;
     child.once('error', error => this.stop(error)); child.stdin.on('error', error => this.stop(error)); child.once('exit', () => this.stop(new Error('app-server exited')));

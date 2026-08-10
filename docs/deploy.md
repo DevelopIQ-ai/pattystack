@@ -28,7 +28,7 @@ This is the one step that needs a browser, because Codex's OAuth redirect lands 
 - **SSH port-forward** — `ssh -L 1455:localhost:1455 you@box`, start the login, then open the printed URL in your local browser. The callback travels back down the tunnel.
 - **Device code** — `patty accounts add <alias> device_code` prints a code to enter on another device, with nothing to forward.
 
-The box needs the Codex CLI installed; set `PATTY_CODEX_COMMAND` if it is not on the service user's PATH, and check with `patty doctor`. Logins survive restarts — the daemon re-attaches an app-server to each persisted sub at boot and prints `restoredSubs`.
+The box needs the Codex CLI installed at a version Patty speaks (`>=0.145.0 <0.148.0`; `PATTY_CODEX_VERSION=<version>` accepts one exact release beyond that once you have verified it). Set `PATTY_CODEX_COMMAND` if it is not on the service user's PATH, and check with `patty doctor` — it fails the `codex_cli` check when the installed version is one Patty cannot drive, which is the state an unattended `codex upgrade` leaves behind. Logins survive restarts — the daemon re-attaches an app-server to each persisted sub at boot and prints `restoredSubs`.
 
 Add metered API credit as the safety net, so you keep answering when every sub is inside its reset window:
 
