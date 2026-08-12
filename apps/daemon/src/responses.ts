@@ -5,6 +5,7 @@
  * the one thing Patty is supposed to make unnecessary.
  */
 import type { ChatToolCall, TokenUsage } from '@patty/contracts';
+import { validateStrictSchema } from './schema-strict.js';
 
 type Part = { type?: unknown; text?: unknown };
 type InputItem = { type?: unknown; role?: unknown; content?: unknown; call_id?: unknown; name?: unknown; arguments?: unknown; output?: unknown };
@@ -42,7 +43,8 @@ export function responsesToChat(body: ResponsesBody): ChatBody {
   const format = body.text?.format;
   /** Responses names the schema fields at the top of `text.format`; chat nests them under `json_schema`. */
   const responseFormat = format?.type === 'json_schema'
-    ? { type: 'json_schema', json_schema: { ...(typeof format.name === 'string' ? { name: format.name } : {}), ...(typeof format.description === 'string' ? { description: format.description } : {}), ...(typeof format.strict === 'boolean' ? { strict: format.strict } : {}), schema: format.schema } }
+    ? (validateStrictSchema(format.schema as Record<string, unknown>, '$'),
+      { type: 'json_schema', json_schema: { ...(typeof format.name === 'string' ? { name: format.name } : {}), ...(typeof format.description === 'string' ? { description: format.description } : {}), ...(typeof format.strict === 'boolean' ? { strict: format.strict } : {}), schema: format.schema as Record<string, unknown> } })
     : format?.type === undefined ? undefined : { type: format.type };
   /** Responses flattens the function onto the tool; chat keeps it nested. Hosted tools (web search and the like) are not something a stacked sub can run, so they are refused rather than dropped. */
   const tools = Array.isArray(body.tools) ? body.tools.map(tool => {
