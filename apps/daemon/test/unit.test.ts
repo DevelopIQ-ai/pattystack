@@ -628,3 +628,15 @@ describe('credential leases', () => {
   it('drops live loans on restart, because the borrower did not survive the daemon it borrowed from', () => { const path = join(tmpdir(), `patty-lease-${randomUUID()}.sqlite`); const first = new Store(path); const a = account('a'); first.addAccount(a); first.openCredentialLease(a.id, 3_600_000); first.close(); const second = new Store(path); second.reconcileWorkers(); expect(second.credentialLeases()).toEqual([]); expect(second.account(a.id)?.activeRuns).toBe(0); });
   it('caps how long a sub can be lent and rejects a nonsense window', () => { expect(leaseTtlMs(undefined)).toBe(300_000); expect(leaseTtlMs(120)).toBe(120_000); expect(leaseTtlMs(86_400)).toBe(3_600_000); expect(() => leaseTtlMs(5)).toThrow('invalid_request'); expect(() => leaseTtlMs('600')).toThrow('invalid_request'); });
 });
+
+describe('failure detail', () => {
+  it('keeps a provider error readable and bounded', async () => {
+    const { failureDetail } = await import('../src/log.js');
+    expect(failureDetail(new Error('401 Unauthorized: refresh_token_invalidated'))).toBe('401 Unauthorized: refresh_token_invalidated');
+    expect(failureDetail('plain string')).toBe('plain string');
+    /** A provider can answer with a whole HTML error page, and a log line is not the place for it. */
+    const long = failureDetail(new Error('x'.repeat(1_000)));
+    expect(long).toHaveLength(301);
+    expect(long.endsWith('…')).toBe(true);
+  });
+});

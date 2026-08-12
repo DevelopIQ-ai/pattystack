@@ -6,6 +6,23 @@ For a safe demo, build and run `node apps/daemon/dist/src/main.js --fake=sub-a -
 
 Adding a Codex account needs the Codex CLI on PATH or in `PATTY_CODEX_COMMAND`, and the adapter verifies it reports a version inside the supported range (`>=0.145.0 <0.148.0`, or the exact release named by `PATTY_CODEX_VERSION`) before starting. When a CLI upgrade outruns that range every Codex sub fails to start and lands in `reconnect_required`, logging `sub_restore_failed`; `patty doctor` reports it as unhealthy rather than as a healthy stack. Account add starts one app-server per opaque alias in an isolated home and uses documented stdio login, snapshot, logout, and shutdown operations. The live harness resumes two existing isolated homes when possible; it only performs an interactive device-code login for homes that are not already authenticated. It then reads account/model/rate-limit state and runs two account-pinned turns plus one unpinned Patty-routed turn without logging prompts, tokens, or account emails. Live test evidence is currently pending.
 
+## A revoked subscription login
+
+A provider can invalidate a sub's login while the daemon runs — a password change, a "log out everywhere", a seat or plan change — and nothing about Patty's stored state changes with it: the sub keeps its `ready` state, its discovered models and its last quota reading, while every turn fails the moment the credential is used. `patty doctor` therefore probes each sub's credential with a live provider call, bounded by `PATTY_DOCTOR_PROBE_MS` (15s), and reports `subs_authenticated` with the provider's own message:
+
+```text
+subs_authenticated  fail  sub-a: 401 Unauthorized: refresh_token_invalidated
+```
+
+Every failed run also logs one `run_failed` line carrying the provider's error, so a dead credential is legible in `journalctl` instead of a bare `upstream_failed`.
+
+The fix is to re-authenticate the sub in place. `accounts add` refuses an alias that already exists — it is for stacking a new sub — so use re-login, which keeps the alias, its id, its isolated home and its run history and only replaces the credential inside them:
+
+```sh
+patty accounts relogin sub-a device_code   # prints a verification URL and a one-time code
+patty accounts refresh <id>                # once approved, re-reads models and quota; sub returns to ready
+```
+
 ## Live account homes
 
 Codex itself may persist its managed credentials in each isolated `CODEX_HOME` so an explicitly authorized operator can resume a device-code login. Patty never reads, exports, or parses those credentials or `auth.json`. Patty creates or accepts only owner-owned, non-symlink account roots and homes, then enforces mode `0700`. The live harness preserves those homes on success or failure for explicit operator resumption; it does not create evidence artifacts. If a persistent home is not already logged in, it will only begin device-code login with `PATTY_LIVE_INTERACTIVE=1` in a TTY and writes the challenge directly to `/dev/tty`, never captured stdout or stderr.

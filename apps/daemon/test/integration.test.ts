@@ -340,7 +340,7 @@ describe('observability', () => {
     savedCommand === undefined ? delete process.env.PATTY_CODEX_COMMAND : process.env.PATTY_CODEX_COMMAND = savedCommand;
     /** A missing Codex CLI is reported, not fatal: `--fake` subs still make the daemon healthy. */
     expect(ready.data.ok).toBe(true);
-    expect(ready.data.checks.map(check => check.check)).toEqual(['subs_stacked', 'subs_servable', 'models_discovered', 'codex_cli', 'active_keys', 'store_writable']);
+    expect(ready.data.checks.map(check => check.check)).toEqual(['subs_stacked', 'subs_servable', 'models_discovered', 'codex_cli', 'subs_authenticated', 'active_keys', 'store_writable']);
     expect(ready.data.checks.find(check => check.check === 'codex_cli')).toMatchObject({ ok: false });
     expect(ready.data.checks.filter(check => check.hint !== undefined).map(check => check.check)).toEqual(['codex_cli']);
     server.close();
@@ -363,6 +363,36 @@ describe('observability', () => {
     expect(drifted.data.ok).toBe(false);
     expect(drifted.data.checks.find(check => check.check === 'codex_cli')).toMatchObject({ ok: false, detail: expect.stringContaining('0.148.0') });
     expect(drifted.data.checks.find(check => check.check === 'codex_cli')?.hint).toContain('PATTY_CODEX_VERSION');
+  });
+
+  /**
+   * The outage doctor used to call healthy: a sub keeps its `ready` state, its discovered models and
+   * its last quota reading after the provider revokes the login underneath it, so only using the
+   * credential tells an operator that every run will fail.
+   */
+  it('fails when a stored sub can no longer use its credential', async () => {
+    const daemon = new PattyDaemon();
+    const account = daemon.addFakeAccount('revoked', ['gpt-5-codex']);
+    const adapter = daemon.adapters.get(account.id)!;
+    adapter.snapshot = async () => { throw new Error('Your authentication token has been invalidated. Please try signing in again.'); };
+    server = await daemon.listen();
+    const port = (server.address() as { port: number }).port;
+    const body = await (await fetch(`http://127.0.0.1:${port}/v1/doctor`, { headers: { authorization: `Bearer ${daemon.key}` } })).json() as { data: { ok: boolean; checks: { check: string; ok: boolean; detail: string; hint?: string }[] } };
+    const check = body.data.checks.find(entry => entry.check === 'subs_authenticated')!;
+    expect(body.data.ok).toBe(false);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('revoked: Your authentication token has been invalidated');
+    expect(check.hint).toContain('relogin');
+    /** The stack still looks servable, which is exactly why the credential needs its own check. */
+    expect(body.data.checks.find(entry => entry.check === 'subs_servable')?.ok).toBe(true);
+  });
+
+  it('bounds the credential probe so one hung sub cannot hang doctor', async () => {
+    const daemon = new PattyDaemon();
+    const account = daemon.addFakeAccount('hung', ['gpt-5-codex']);
+    daemon.adapters.get(account.id)!.snapshot = () => new Promise(() => undefined);
+    const probes = await daemon.credentials(20);
+    expect(probes).toEqual([{ alias: 'hung', ok: false, reason: 'probe_timed_out' }]);
   });
 });
 
