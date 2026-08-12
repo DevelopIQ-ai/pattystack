@@ -111,6 +111,31 @@ describe('OpenAI-compatible surface', () => {
     expect(report.data.totals.totalTokens).toBeGreaterThan(0);
     expect(report.data.accounts).toMatchObject([{ alias: 'sub-a', runs: 1 }]);
   });
+
+  it('rejects a non-strict json_schema before dispatch with a descriptive 400', async () => { const { url, headers } = await setup();
+    const response = await fetch(`${url}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-5-codex', messages: [{ role: 'user', content: 'x' }], response_format: { type: 'json_schema', json_schema: { name: 'person', schema: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' }, nickname: { type: 'string' } }, required: ['name'] } } } }) });
+    expect(response.status).toBe(400);
+    const body = await response.json() as { error: { code: string; message: string } };
+    expect(body.error.code).toBe('invalid_request');
+    expect(body.error.message).toContain('response_format.json_schema.schema.properties.nickname is optional');
+  });
+
+  it('accepts a strict json_schema for chat completions', async () => { const { url, headers } = await setup();
+    const response = await fetch(`${url}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-5-codex', messages: [{ role: 'user', content: 'x' }], response_format: { type: 'json_schema', json_schema: { name: 'person', schema: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' }, nickname: { type: ['string', 'null'] } }, required: ['name', 'nickname'] } } } }) });
+    expect(response.status).toBe(200);
+  });
+
+  it('rejects an optional property on /v1/responses with a descriptive 400', async () => { const { url, headers } = await setup();
+    const response = await fetch(`${url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-5-codex', input: 'x', text: { format: { type: 'json_schema', name: 'person', schema: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' }, nickname: { type: 'string' } }, required: ['name'] } } } }) });
+    expect(response.status).toBe(400);
+    const body = await response.json() as { error: { code: string; message: string } };
+    expect(body.error.message).toContain('text.format.schema.properties.nickname is optional');
+  });
+
+  it('accepts a strict schema on /v1/responses', async () => { const { url, headers } = await setup();
+    const response = await fetch(`${url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-5-codex', input: 'x', text: { format: { type: 'json_schema', name: 'person', schema: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' } }, required: ['name'] } } } }) });
+    expect(response.status).toBe(200);
+  });
 });
 
 describe('quota failover', () => {
@@ -693,7 +718,7 @@ describe('tool calling', () => {
 });
 
 describe('structured output', () => {
-  const schema = { type: 'object', properties: { company_name: { type: 'string' }, employee_count: { type: 'integer' }, remote: { type: 'boolean' }, tags: { type: 'array', items: { type: 'string' } } }, required: ['company_name', 'employee_count'], additionalProperties: false };
+  const schema = { type: 'object', properties: { company_name: { type: 'string' }, employee_count: { type: 'integer' }, remote: { type: 'boolean' }, tags: { type: 'array', items: { type: 'string' } } }, required: ['company_name', 'employee_count', 'remote', 'tags'], additionalProperties: false };
   const responseFormat = { type: 'json_schema', json_schema: { name: 'company', strict: true, schema } };
   const boot = async () => { const daemon = new PattyDaemon(); daemon.addFakeAccount('codex-work'); server = await daemon.listen(); return { port: (server.address() as { port: number }).port, headers: { authorization: `Bearer ${daemon.key}`, 'content-type': 'application/json' } }; };
 
@@ -832,7 +857,7 @@ describe('responses API', () => {
 
   it('honours text.format json_schema the way response_format does', async () => {
     const { port, headers } = await boot();
-    const body = await (await post(port, headers, { input: 'describe', text: { format: { type: 'json_schema', name: 'company', strict: true, schema: { type: 'object', properties: { company_name: { type: 'string' } } } } } })).json() as ResponseBody;
+    const body = await (await post(port, headers, { input: 'describe', text: { format: { type: 'json_schema', name: 'company', strict: true, schema: { type: 'object', additionalProperties: false, properties: { company_name: { type: 'string' } }, required: ['company_name'] } } } })).json() as ResponseBody;
     expect(JSON.parse(body.output_text)).toEqual({ company_name: 'fake' });
   });
 

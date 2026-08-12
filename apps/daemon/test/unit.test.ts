@@ -9,6 +9,7 @@ import { responsesBody, responsesToChat } from '../src/responses.js';
 import { Coordinator, FakeAdapter, KeyLimiter, RateLimited, Router, Store, cacheHitRate, effectiveQuota, eligible, id, now, quotaExhausted, resetUrgency, score } from '../src/core.js';
 import { estimateCost, loadPrices } from '../src/pricing.js';
 import { SUPPORTED_CODEX_VERSIONS, bridgePreamble, codexOutputSchema, codexVersionSupported } from '../src/codex.js';
+import { validateStrictSchema } from '../src/schema-strict.js';
 import { writeFileSync } from 'node:fs';
 import { PattyDaemon, leaseTtlMs, parseReasoningEffort, parseResponseFormat, parseSampling, splitConversation } from '../src/server.js';
 const account = (id: string, remaining = 1, tier: Account['tier'] = 'primary'): Account => ({ id, alias: id, tier, state: 'ready', models: ['gpt-5-codex'], quota: { remaining, observedAt: now() }, health: 1, activeRuns: 0 });
@@ -372,8 +373,14 @@ describe('structured output plumbing', () => {
   it('accepts the response_format shapes OpenAI clients send and refuses the rest', () => {
     expect(parseResponseFormat(undefined)).toBeUndefined();
     expect(parseResponseFormat({ type: 'json_object' })).toEqual({ type: 'json_object' });
-    expect(parseResponseFormat({ type: 'json_schema', json_schema: { name: 'c', strict: true, schema: { type: 'object' }, extra: 'ignored' } })).toEqual({ type: 'json_schema', json_schema: { name: 'c', strict: true, schema: { type: 'object' } } });
-    for (const bad of [{ type: 'json_schema' }, { type: 'json_schema', json_schema: { schema: 'object' } }, { type: 'nonsense' }]) expect(() => parseResponseFormat(bad)).toThrow('invalid_request');
+    expect(parseResponseFormat({ type: 'json_schema', json_schema: { name: 'c', strict: true, schema: { type: 'object', additionalProperties: false }, extra: 'ignored' } })).toEqual({ type: 'json_schema', json_schema: { name: 'c', strict: true, schema: { type: 'object', additionalProperties: false } } });
+    for (const bad of [
+      { type: 'json_schema' },
+      { type: 'json_schema', json_schema: { schema: 'object' } },
+      { type: 'json_schema', json_schema: { schema: { type: 'object', properties: { a: { type: 'string' } } } } },
+      { type: 'json_schema', json_schema: { schema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } } },
+      { type: 'nonsense' }
+    ]) expect(() => parseResponseFormat(bad), JSON.stringify(bad)).toThrow(/invalid_request|response_format\.json_schema\.schema/);
   });
   it('translates response_format into the app-server output schema', () => {
     const schema = { type: 'object', properties: { a: { type: 'string' } } };
@@ -403,6 +410,107 @@ describe('structured output plumbing', () => {
     const runId = await coordinator.start({ model: 'gpt-5-codex', input: 'x', responseFormat });
     await coordinator.collect(runId);
     expect(seen).toEqual([responseFormat]);
+  });
+});
+
+describe('strict structured output schema validation', () => {
+  it('accepts valid strict schemas', () => {
+    expect(() => validateStrictSchema({ type: 'object', additionalProperties: false })).not.toThrow();
+    expect(() => validateStrictSchema({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        name: { type: 'string' },
+        nickname: { type: ['string', 'null'] }
+      },
+      required: ['name', 'nickname']
+    })).not.toThrow();
+  });
+
+  it('rejects optional scalar properties', () => {
+    expect(() => validateStrictSchema({
+      type: 'object',
+      additionalProperties: false,
+      properties: { name: { type: 'string' }, nickname: { type: 'string' } },
+      required: ['name']
+    }, 'schema')).toThrow('schema.properties.nickname is optional');
+  });
+
+  it('rejects objects without additionalProperties false', () => {
+    expect(() => validateStrictSchema({
+      type: 'object',
+      properties: { a: { type: 'string' } },
+      required: ['a']
+    })).toThrow('schema.additionalProperties must be false');
+  });
+
+  it('rejects optional nested objects', () => {
+    expect(() => validateStrictSchema({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        name: { type: 'string' },
+        address: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { city: { type: 'string' } },
+          required: ['city']
+        }
+      },
+      required: ['name']
+    }, 'schema')).toThrow('schema.properties.address is optional');
+  });
+
+  it('rejects nested objects that violate strict rules', () => {
+    expect(() => validateStrictSchema({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        name: { type: 'string' },
+        address: {
+          type: 'object',
+          additionalProperties: true,
+          properties: { city: { type: 'string' } },
+          required: ['city']
+        }
+      },
+      required: ['name', 'address']
+    }, 'schema')).toThrow('schema.properties.address.additionalProperties must be false');
+  });
+
+  it('rejects optional properties inside array items', () => {
+    expect(() => validateStrictSchema({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        tags: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { label: { type: 'string' } },
+            required: ['label']
+          }
+        }
+      },
+      required: ['tags']
+    }, 'schema')).not.toThrow();
+    expect(() => validateStrictSchema({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        tags: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { label: { type: 'string' }, score: { type: 'number' } },
+            required: ['label']
+          }
+        }
+      },
+      required: ['tags']
+    }, 'schema')).toThrow('schema.properties.tags.items.properties.score is optional');
   });
 });
 
@@ -516,7 +624,7 @@ describe('responses translation', () => {
       { role: 'user', content: [{ type: 'input_text', text: 'weather?' }] },
       { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Denver"}' },
       { type: 'function_call_output', call_id: 'call_1', output: 'sunny' }
-    ], tools: [{ type: 'function', name: 'get_weather', parameters: { type: 'object' } }], reasoning: { effort: 'high' }, max_output_tokens: 64, text: { format: { type: 'json_schema', name: 'w', strict: true, schema: { type: 'object' } } } })).toEqual({
+    ], tools: [{ type: 'function', name: 'get_weather', parameters: { type: 'object' } }], reasoning: { effort: 'high' }, max_output_tokens: 64, text: { format: { type: 'json_schema', name: 'w', strict: true, schema: { type: 'object', additionalProperties: false } } } })).toEqual({
       model: 'm',
       messages: [
         { role: 'system', content: 'be terse' },
@@ -525,7 +633,7 @@ describe('responses translation', () => {
         { role: 'tool', tool_call_id: 'call_1', content: 'sunny' }
       ],
       tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
-      response_format: { type: 'json_schema', json_schema: { name: 'w', strict: true, schema: { type: 'object' } } },
+      response_format: { type: 'json_schema', json_schema: { name: 'w', strict: true, schema: { type: 'object', additionalProperties: false } } },
       reasoning_effort: 'high', max_completion_tokens: 64
     });
   });
