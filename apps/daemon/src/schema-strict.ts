@@ -9,7 +9,17 @@
  * This is intentionally not a generic JSON Schema validator; it only checks the
  * two rules that make upstream reject a turn with a useless "run failed" 502.
  */
-export function validateStrictSchema(schema: unknown, path = 'schema'): void {
+export class InvalidSchemaError extends Error {
+  readonly code = 'invalid_json_schema';
+  constructor(
+    readonly path: string,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+export function validateStrictSchema(schema: unknown, path = '$'): void {
   if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) return;
   const node = schema as Record<string, unknown>;
   const type = node.type;
@@ -19,31 +29,31 @@ export function validateStrictSchema(schema: unknown, path = 'schema'): void {
 
   if (isObject) {
     if (node.additionalProperties !== false) {
-      throw new Error(`${path}.additionalProperties must be false for strict structured output`);
+      throw new InvalidSchemaError(path, 'Object schemas must set additionalProperties to false for Codex outputSchema.');
     }
 
     const properties = node.properties ?? {};
     if (typeof properties !== 'object' || Array.isArray(properties) || properties === null) {
-      throw new Error(`${path}.properties must be an object`);
+      throw new InvalidSchemaError(`${path}.properties`, 'properties must be an object.');
     }
 
     const hasProperties = Object.keys(properties).length > 0;
     const required = node.required;
     if (hasProperties && !Array.isArray(required)) {
-      throw new Error(`${path}.required must be an array of property names`);
+      throw new InvalidSchemaError(`${path}.required`, 'Object schemas with properties must list every property in required for Codex outputSchema.');
     }
 
     const requiredSet = new Set<string>();
     if (Array.isArray(required)) {
       for (const entry of required) {
-        if (typeof entry !== 'string') throw new Error(`${path}.required must contain only strings`);
+        if (typeof entry !== 'string') throw new InvalidSchemaError(`${path}.required`, 'required must contain only strings.');
         requiredSet.add(entry);
       }
     }
 
     for (const key of Object.keys(properties)) {
       if (!requiredSet.has(key)) {
-        throw new Error(`${path}.properties.${key} is optional; every property must appear in ${path}.required for strict structured output`);
+        throw new InvalidSchemaError(`${path}.properties.${key}`, 'Every object property must be listed in required for Codex outputSchema.');
       }
       validateStrictSchema((properties as Record<string, unknown>)[key], `${path}.properties.${key}`);
     }

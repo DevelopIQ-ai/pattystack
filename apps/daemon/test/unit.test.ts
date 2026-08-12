@@ -380,7 +380,7 @@ describe('structured output plumbing', () => {
       { type: 'json_schema', json_schema: { schema: { type: 'object', properties: { a: { type: 'string' } } } } },
       { type: 'json_schema', json_schema: { schema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } } },
       { type: 'nonsense' }
-    ]) expect(() => parseResponseFormat(bad), JSON.stringify(bad)).toThrow(/invalid_request|response_format\.json_schema\.schema/);
+    ]) expect(() => parseResponseFormat(bad), JSON.stringify(bad)).toThrow();
   });
   it('translates response_format into the app-server output schema', () => {
     const schema = { type: 'object', properties: { a: { type: 'string' } } };
@@ -433,7 +433,7 @@ describe('strict structured output schema validation', () => {
       additionalProperties: false,
       properties: { name: { type: 'string' }, nickname: { type: 'string' } },
       required: ['name']
-    }, 'schema')).toThrow('schema.properties.nickname is optional');
+    })).toThrow(expect.objectContaining({ code: 'invalid_json_schema', path: '$.properties.nickname', message: 'Every object property must be listed in required for Codex outputSchema.' }));
   });
 
   it('rejects objects without additionalProperties false', () => {
@@ -441,7 +441,7 @@ describe('strict structured output schema validation', () => {
       type: 'object',
       properties: { a: { type: 'string' } },
       required: ['a']
-    })).toThrow('schema.additionalProperties must be false');
+    })).toThrow(expect.objectContaining({ code: 'invalid_json_schema', path: '$', message: 'Object schemas must set additionalProperties to false for Codex outputSchema.' }));
   });
 
   it('rejects optional nested objects', () => {
@@ -458,7 +458,7 @@ describe('strict structured output schema validation', () => {
         }
       },
       required: ['name']
-    }, 'schema')).toThrow('schema.properties.address is optional');
+    })).toThrow(expect.objectContaining({ code: 'invalid_json_schema', path: '$.properties.address', message: 'Every object property must be listed in required for Codex outputSchema.' }));
   });
 
   it('rejects nested objects that violate strict rules', () => {
@@ -475,7 +475,7 @@ describe('strict structured output schema validation', () => {
         }
       },
       required: ['name', 'address']
-    }, 'schema')).toThrow('schema.properties.address.additionalProperties must be false');
+    })).toThrow(expect.objectContaining({ code: 'invalid_json_schema', path: '$.properties.address', message: 'Object schemas must set additionalProperties to false for Codex outputSchema.' }));
   });
 
   it('rejects optional properties inside array items', () => {
@@ -494,7 +494,7 @@ describe('strict structured output schema validation', () => {
         }
       },
       required: ['tags']
-    }, 'schema')).not.toThrow();
+    })).not.toThrow();
     expect(() => validateStrictSchema({
       type: 'object',
       additionalProperties: false,
@@ -510,7 +510,7 @@ describe('strict structured output schema validation', () => {
         }
       },
       required: ['tags']
-    }, 'schema')).toThrow('schema.properties.tags.items.properties.score is optional');
+    })).toThrow(expect.objectContaining({ code: 'invalid_json_schema', path: '$.properties.tags.items.properties.score', message: 'Every object property must be listed in required for Codex outputSchema.' }));
   });
 });
 

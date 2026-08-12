@@ -115,9 +115,11 @@ describe('OpenAI-compatible surface', () => {
   it('rejects a non-strict json_schema before dispatch with a descriptive 400', async () => { const { url, headers } = await setup();
     const response = await fetch(`${url}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-5-codex', messages: [{ role: 'user', content: 'x' }], response_format: { type: 'json_schema', json_schema: { name: 'person', schema: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' }, nickname: { type: 'string' } }, required: ['name'] } } } }) });
     expect(response.status).toBe(400);
-    const body = await response.json() as { error: { code: string; message: string } };
-    expect(body.error.code).toBe('invalid_request');
-    expect(body.error.message).toContain('response_format.json_schema.schema.properties.nickname is optional');
+    const body = await response.json() as { error: { type: string; code: string; message: string; path: string } };
+    expect(body.error.type).toBe('invalid_request_error');
+    expect(body.error.code).toBe('invalid_json_schema');
+    expect(body.error.message).toBe('Every object property must be listed in required for Codex outputSchema.');
+    expect(body.error.path).toBe('$.properties.nickname');
   });
 
   it('accepts a strict json_schema for chat completions', async () => { const { url, headers } = await setup();
@@ -128,8 +130,10 @@ describe('OpenAI-compatible surface', () => {
   it('rejects an optional property on /v1/responses with a descriptive 400', async () => { const { url, headers } = await setup();
     const response = await fetch(`${url}/v1/responses`, { method: 'POST', headers, body: JSON.stringify({ model: 'gpt-5-codex', input: 'x', text: { format: { type: 'json_schema', name: 'person', schema: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' }, nickname: { type: 'string' } }, required: ['name'] } } } }) });
     expect(response.status).toBe(400);
-    const body = await response.json() as { error: { code: string; message: string } };
-    expect(body.error.message).toContain('text.format.schema.properties.nickname is optional');
+    const body = await response.json() as { error: { type: string; code: string; message: string; path: string } };
+    expect(body.error.type).toBe('invalid_request_error');
+    expect(body.error.code).toBe('invalid_json_schema');
+    expect(body.error.path).toBe('$.properties.nickname');
   });
 
   it('accepts a strict schema on /v1/responses', async () => { const { url, headers } = await setup();
