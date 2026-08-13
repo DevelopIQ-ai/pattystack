@@ -10,6 +10,7 @@ import { Coordinator, FakeAdapter, KeyLimiter, RateLimited, Router, Store, cache
 import { estimateCost, loadPrices } from '../src/pricing.js';
 import { SUPPORTED_CODEX_VERSIONS, bridgePreamble, codexOutputSchema, codexVersionSupported } from '../src/codex.js';
 import { validateStrictSchema } from '../src/schema-strict.js';
+import { applyOriginalSchema, stripOptionalNulls, toStrictSchema } from '../src/schema-compat.js';
 import { writeFileSync } from 'node:fs';
 import { PattyDaemon, leaseTtlMs, parseReasoningEffort, parseResponseFormat, parseSampling, splitConversation } from '../src/server.js';
 const account = (id: string, remaining = 1, tier: Account['tier'] = 'primary'): Account => ({ id, alias: id, tier, state: 'ready', models: ['gpt-5-codex'], quota: { remaining, observedAt: now() }, health: 1, activeRuns: 0 });
@@ -373,14 +374,22 @@ describe('structured output plumbing', () => {
   it('accepts the response_format shapes OpenAI clients send and refuses the rest', () => {
     expect(parseResponseFormat(undefined)).toBeUndefined();
     expect(parseResponseFormat({ type: 'json_object' })).toEqual({ type: 'json_object' });
-    expect(parseResponseFormat({ type: 'json_schema', json_schema: { name: 'c', strict: true, schema: { type: 'object', additionalProperties: false }, extra: 'ignored' } })).toEqual({ type: 'json_schema', json_schema: { name: 'c', strict: true, schema: { type: 'object', additionalProperties: false } } });
+    expect(parseResponseFormat({ type: 'json_schema', json_schema: { name: 'c', strict: true, schema: { type: 'object', additionalProperties: false }, extra: 'ignored' } })).toMatchObject({ type: 'json_schema', json_schema: { name: 'c', strict: true, schema: { type: 'object', additionalProperties: false } } });
+    const normalized = parseResponseFormat({ type: 'json_schema', json_schema: { name: 'n', schema: { type: 'object', additionalProperties: false, properties: { a: { type: 'string' } }, required: ['a'] } } });
+    expect(normalized).toMatchObject({ type: 'json_schema', json_schema: { name: 'n', strict: true, schema: { type: 'object', additionalProperties: false, properties: { a: { type: 'string' } }, required: ['a'] } } });
     for (const bad of [
       { type: 'json_schema' },
       { type: 'json_schema', json_schema: { schema: 'object' } },
-      { type: 'json_schema', json_schema: { schema: { type: 'object', properties: { a: { type: 'string' } } } } },
-      { type: 'json_schema', json_schema: { schema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } } },
       { type: 'nonsense' }
     ]) expect(() => parseResponseFormat(bad), JSON.stringify(bad)).toThrow();
+  });
+  it('normalizes a non-strict json_schema into a strict version the provider can serve', () => {
+    const parsed = parseResponseFormat({ type: 'json_schema', json_schema: { name: 'n', strict: false, schema: { type: 'object', properties: { name: { type: 'string' }, nickname: { type: 'string' } }, required: ['name'] } } });
+    expect(parsed).toMatchObject({ type: 'json_schema', json_schema: { name: 'n', strict: true, schema: { type: 'object', additionalProperties: false, properties: { name: { type: 'string' }, nickname: { type: ['string', 'null'] } }, required: ['name', 'nickname'] } } });
+  });
+  it('rejects an invalid non-strict json_schema', () => {
+    expect(() => parseResponseFormat({ type: 'json_schema', json_schema: { schema: { type: 'object', properties: { a: { type: 'string' } }, required: [1] } } })).toThrow();
+    expect(() => parseResponseFormat({ type: 'json_schema', json_schema: { schema: { type: 'object', properties: 'nope' } } })).toThrow();
   });
   it('translates response_format into the app-server output schema', () => {
     const schema = { type: 'object', properties: { a: { type: 'string' } } };
@@ -410,6 +419,30 @@ describe('structured output plumbing', () => {
     const runId = await coordinator.start({ model: 'gpt-5-codex', input: 'x', responseFormat });
     await coordinator.collect(runId);
     expect(seen).toEqual([responseFormat]);
+  });
+});
+
+describe('json_schema compatibility translation', () => {
+  it('turns an optional property into a required nullable one for the provider', () => {
+    const original = { type: 'object', properties: { name: { type: 'string' }, nickname: { type: 'string' } }, required: ['name'] };
+    const strict = toStrictSchema(original);
+    expect(strict).toMatchObject({ type: 'object', additionalProperties: false, required: ['name', 'nickname'], properties: { name: { type: 'string' }, nickname: { type: ['string', 'null'] } } });
+    expect(() => validateStrictSchema(strict)).not.toThrow();
+  });
+  it('fills in missing additionalProperties and required for the provider', () => {
+    const original = { type: 'object', properties: { a: { type: 'string' } } };
+    const strict = toStrictSchema(original);
+    expect(strict).toMatchObject({ type: 'object', additionalProperties: false, required: ['a'], properties: { a: { type: ['string', 'null'] } } });
+  });
+  it('strips provider-forced nulls from optional properties and keeps required nullable ones', () => {
+    const original = { type: 'object', properties: { name: { type: 'string' }, nickname: { type: ['string', 'null'] } }, required: ['name', 'nickname'] };
+    expect(stripOptionalNulls({ name: 'Siddharth', nickname: null }, original)).toEqual({ name: 'Siddharth', nickname: null });
+    expect(stripOptionalNulls({ name: 'Siddharth', nickname: null }, { type: 'object', properties: { name: { type: 'string' }, nickname: { type: 'string' } }, required: ['name'] })).toEqual({ name: 'Siddharth' });
+  });
+  it('validates output against the original caller schema after stripping', () => {
+    const original = { type: 'object', properties: { name: { type: 'string' }, nickname: { type: 'string' } }, required: ['name'] };
+    expect(applyOriginalSchema('{"name":"Siddharth","nickname":null}', original)).toBe('{"name":"Siddharth"}');
+    expect(() => applyOriginalSchema('{"name":"Siddharth","extra":1}', { type: 'object', properties: { name: { type: 'string' } }, required: ['name'], additionalProperties: false })).toThrow();
   });
 });
 
