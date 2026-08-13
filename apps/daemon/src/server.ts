@@ -12,7 +12,8 @@ import { ToolBridge } from './tool-bridge.js';
 import { loadAliases, resolveModel } from './aliases.js';
 import { failureDetail, logLine } from './log.js';
 import { type ChatBody, type ResponsesBody, responsesBody, responsesToChat } from './responses.js';
-import { InvalidSchemaError, validateStrictSchema } from './schema-strict.js';
+import { InvalidSchemaError } from './schema-strict.js';
+import { formatJsonSchema, getOriginalSchema, ORIGINAL_SCHEMA } from './schema-compat.js';
 const json=async(req:IncomingMessage)=>{let data='';for await(const c of req)data+=c;return data?JSON.parse(data):{};};
 const write=(res:ServerResponse,status:number,value:unknown,headers:Record<string,string>={})=>{res.writeHead(status,{'content-type':'application/json',...headers});res.end(JSON.stringify(value));};
 /** Thrown errors that start with `invalid_request: ` carry a client-safe detail; bare `invalid_request` falls back to a generic phrase. */
@@ -58,7 +59,7 @@ export function openaiUsage(usage?:TokenUsage){if(!usage)return undefined;return
  * would otherwise be dropped silently and answered with prose, which is the one failure a
  * structured caller cannot see coming, so a malformed one is refused instead.
  */
-export function parseResponseFormat(value:unknown):ChatResponseFormat|undefined{if(value===undefined||value===null)return undefined;const format=value as {type?:unknown;json_schema?:{name?:unknown;description?:unknown;schema?:unknown;strict?:unknown}};if(format.type==='text')return {type:'text'};if(format.type==='json_object')return {type:'json_object'};if(format.type!=='json_schema')throw new Error('invalid_request');const declared=format.json_schema;const schema=declared?.schema;if(!schema||typeof schema!=='object'||Array.isArray(schema))throw new Error('invalid_request');validateStrictSchema(schema as Record<string,unknown>,'$');return {type:'json_schema',json_schema:{...(typeof declared?.name==='string'?{name:declared.name}:{}),...(typeof declared?.description==='string'?{description:declared.description}:{}),...(typeof declared?.strict==='boolean'?{strict:declared.strict}:{}),schema:schema as Record<string,unknown>}};}
+export function parseResponseFormat(value:unknown):ChatResponseFormat|undefined{if(value===undefined||value===null)return undefined;const format=value as {type?:unknown;json_schema?:{name?:unknown;description?:unknown;schema?:unknown;strict?:unknown}};if(format.type==='text')return {type:'text'};if(format.type==='json_object')return {type:'json_object'};if(format.type!=='json_schema')throw new Error('invalid_request');const declared=format.json_schema;return formatJsonSchema(declared?.name,declared?.description,declared?.strict,declared?.schema) as ChatResponseFormat;}
 /** Limits are replaced wholesale: an omitted or null field means unlimited, so a PUT is the key's complete policy. */
 export function parseLimits(body:Record<string,unknown>){const one=(value:unknown)=>{if(value===undefined||value===null)return undefined;if(typeof value!=='number'||!Number.isFinite(value)||value<1)throw new Error('invalid_request');return Math.floor(value);};return {rpm:one(body.rpm),concurrency:one(body.concurrency)};}
 /**
@@ -202,7 +203,9 @@ export class PattyDaemon { store:Store; router:Router; coordinator:Coordinator; 
   if(!stream){const result=await this.coordinator.collect(runId,undefined,undefined,seed);
    if(result.status!=='completed'&&result.status!=='awaiting_tools')return write(res,502,{error:{code:'upstream_failed',message:`run ${result.status}`,requestId,retryable:true}},headers());
    const calls=this.park(runId,result);
-   return write(res,200,{id:runId,object:'chat.completion',created,model,choices:[{index:0,message:{role:'assistant',content:calls?.length?null:result.text,...(result.reasoning?{reasoning_content:result.reasoning}:{}),...(calls?.length?{tool_calls:calls}:{})},finish_reason:calls?.length?'tool_calls':'stop'}],...(openaiUsage(result.usage)?{usage:openaiUsage(result.usage)}:{})},headers());
+   let finalText=result.text;
+   if(!calls?.length){try{finalText=this.coordinator.finalizeOutput(runId,result.text,result.status);}catch{return write(res,502,{error:{code:'upstream_failed',message:'output did not match the requested schema',requestId,retryable:true}},headers());}}
+   return write(res,200,{id:runId,object:'chat.completion',created,model,choices:[{index:0,message:{role:'assistant',content:calls?.length?null:finalText,...(result.reasoning?{reasoning_content:result.reasoning}:{}),...(calls?.length?{tool_calls:calls}:{})},finish_reason:calls?.length?'tool_calls':'stop'}],...(openaiUsage(result.usage)?{usage:openaiUsage(result.usage)}:{})},headers());
   }
   const chunk=(value:unknown)=>res.write(`data: ${JSON.stringify(value)}\n\n`);
   const delta=(value:Record<string,unknown>,finish:string|null=null,usage?:TokenUsage)=>chunk({id:runId,object:'chat.completion.chunk',created,model,choices:[{index:0,delta:value,finish_reason:finish}],...(usage&&openaiUsage(usage)?{usage:openaiUsage(usage)}:{})});
@@ -221,7 +224,9 @@ export class PattyDaemon { store:Store; router:Router; coordinator:Coordinator; 
   if(!stream){const result=await this.coordinator.collect(runId,undefined,undefined,seed);
    if(result.status!=='completed'&&result.status!=='awaiting_tools')return write(res,502,{error:{code:'upstream_failed',message:`run ${result.status}`,requestId,retryable:true}},headers());
    const calls=this.park(runId,result);
-   return write(res,200,responsesBody(runId,model,created,calls?.length?'':result.text,calls,result.usage),headers());
+   let finalText=result.text;
+   if(!calls?.length){try{finalText=this.coordinator.finalizeOutput(runId,result.text,result.status);}catch{return write(res,502,{error:{code:'upstream_failed',message:'output did not match the requested schema',requestId,retryable:true}},headers());}}
+   return write(res,200,responsesBody(runId,model,created,calls?.length?'':finalText,calls,result.usage),headers());
   }
   let sequence=0,text='';const item='msg_0',reasoningItem='rs_0';
   const event=(type:string,payload:Record<string,unknown>)=>res.write(`event: ${type}\ndata: ${JSON.stringify({type,sequence_number:sequence++,...payload})}\n\n`);
