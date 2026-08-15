@@ -112,7 +112,40 @@ export class PattyDaemon { store:Store; router:Router; coordinator:Coordinator; 
  /** Re-attach app-server workers to subs that were already logged in before a restart. */
  /** Re-attaches OpenAI-compatible subs after a restart; the key is re-read from the environment, never from the store. */
  async restoreOpenAiCompatibleAccounts(){const restored:Account[]=[];for(const record of this.store.providerConfigs()){if(record.kind!=='openai_compatible')continue;const account=this.store.account(record.accountId);if(!account||account.state==='removed'||this.adapters.has(account.id))continue;this.supervise(account.id,new OpenAiCompatibleAdapter({baseUrl:record.config.baseUrl!,apiKeyEnv:record.config.apiKeyEnv!}));account.state='ready';this.store.updateAccount(account);restored.push(account);}return restored;}
- async restoreCodexAccounts(){const command=this.liveCodexCommand();const root=process.env.PATTY_ACCOUNT_HOME_ROOT??'.patty/accounts';const restored:Account[]=[];for(const account of this.store.accounts()){if(account.state==='removed'||this.adapters.has(account.id))continue;const home=join(root,account.alias);if(!existsSync(home))continue;const adapter=new CodexAppServerAdapter(command,['app-server'],privateDirectory(home),SUPPORTED_CODEX_VERSIONS.min,undefined,this.bridge);this.homes.set(account.id,home);this.supervise(account.id,adapter);try{await adapter.start();await this.refreshAccount(account.id);restored.push(this.store.account(account.id)!);}catch(error){/** A sub that silently sits in reconnect_required looks like an empty stack; the reason is the only way an operator learns the login is fine and the CLI is not. */logLine({event:'sub_restore_failed',sub:account.alias,reason:(error as Error).message});account.state='reconnect_required';this.store.updateAccount(account);}}return restored;}
+ async restoreCodexAccounts(){
+  const command=this.liveCodexCommand();
+  const root=process.env.PATTY_ACCOUNT_HOME_ROOT??'.patty/accounts';
+  const restored:Account[]=[];
+  const work:(()=>Promise<void>)[]=[];
+  for(const account of this.store.accounts()){
+    if(account.state==='removed'||this.adapters.has(account.id))continue;
+    const home=join(root,account.alias);
+    if(!existsSync(home))continue;
+    work.push(async()=>{
+      const adapter=new CodexAppServerAdapter(command,['app-server'],privateDirectory(home),SUPPORTED_CODEX_VERSIONS.min,undefined,this.bridge);
+      this.homes.set(account.id,home);
+      this.supervise(account.id,adapter);
+      try{
+        await adapter.start();
+        await adapter.identityFingerprint();
+        restored.push(await this.refreshAccount(account.id));
+      }catch(error){
+        await adapter.shutdown().catch(()=>undefined);
+        this.adapters.delete(account.id);
+        this.homes.delete(account.id);
+        /** A sub that silently sits in reconnect_required looks like an empty stack; the reason is the only way an operator learns the login is fine and the CLI is not. */
+        logLine({event:'sub_restore_failed',sub:account.alias,reason:(error as Error).message});
+        account.state='reconnect_required';
+        this.store.updateAccount(account);
+      }
+    });
+  }
+  const concurrency=Math.max(1,Math.min(Number(process.env.PATTY_RESTORE_CONCURRENCY)||3,10));
+  let index=0;
+  const workers=Array.from({length:concurrency},async()=>{while(index<work.length){const task=work[index++];if(!task)break;await task();}});
+  await Promise.all(workers);
+  return restored;
+}
  async addCodexAccount(alias:string,mode:'browser'|'device_code'){const command=this.liveCodexCommand();if(!/^[a-z0-9-]{1,64}$/i.test(alias))throw new Error('invalid_request');if(this.store.accounts().some(account=>account.alias===alias))throw new Error('invalid_request');const root=privateDirectory(process.env.PATTY_ACCOUNT_HOME_ROOT??'.patty/accounts');const home=privateDirectory(join(root,alias));const adapter=new CodexAppServerAdapter(command,['app-server'],home,SUPPORTED_CODEX_VERSIONS.min,undefined,this.bridge);const account:Account={id:id('acct'),alias,tier:'primary',state:'pending_login',models:[],quota:{observedAt:now()},health:1,activeRuns:0};this.store.addAccount(account);this.homes.set(account.id,home);this.supervise(account.id,adapter);try{await adapter.start();const challenge=await adapter.login(mode);return {id:account.id,...challenge};}catch(error){this.adapters.delete(account.id);this.homes.delete(account.id);rmSync(home,{recursive:true,force:true});this.store.deleteAccountCascade(account.id);throw error;}}
  /**
   * A revoked ChatGPT login is not a new sub: the alias, its history and its isolated home all still

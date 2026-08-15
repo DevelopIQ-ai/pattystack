@@ -16,8 +16,11 @@ for (const argument of process.argv.filter(value => value === '--fake' || value.
     daemon.store.updateAccount(account);
   }
 }
-const restored = [...await daemon.restoreCodexAccounts(), ...await daemon.restoreOpenAiCompatibleAccounts()];
-const server = await daemon.listen(Number(process.env.PATTY_PORT ?? 3210), process.env.PATTY_HOST ?? '127.0.0.1');
-console.log(JSON.stringify({ listening: server.address(), ...(restored.length ? { restoredSubs: restored.map(account => account.alias) } : {}), ...(daemon.key ? { apiKey: daemon.key, warning: 'API key shown once; store it securely' } : { warning: 'existing local Patty key required; no new key was issued' }) }));
+const port = Number(process.env.PATTY_PORT ?? 3210);
+const host = process.env.PATTY_HOST ?? '127.0.0.1';
+const server = await daemon.listen(port, host);
+console.log(JSON.stringify({ listening: server.address(), ...(daemon.key ? { apiKey: daemon.key, warning: 'API key shown once; store it securely' } : { warning: 'existing local Patty key required; no new key was issued' }) }));
+const restored = (await Promise.all([daemon.restoreCodexAccounts(), daemon.restoreOpenAiCompatibleAccounts()])).flat();
+if (restored.length) console.log(JSON.stringify({ event: 'subs_restored', restoredSubs: restored.map(account => account.alias) }));
 const shutdown = () => void daemon.shutdown().finally(() => server.close(() => process.exit(0)));
 process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
