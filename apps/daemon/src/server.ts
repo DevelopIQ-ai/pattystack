@@ -146,6 +146,29 @@ export class PattyDaemon { store:Store; router:Router; coordinator:Coordinator; 
   await Promise.all(workers);
   return restored;
 }
+ /** Background health check: re-verify each ready sub periodically and immediately on token revoke. */
+ private healthTimer?:NodeJS.Timeout;
+ startBackgroundJobs(){
+  const interval=Number(process.env.PATTY_HEALTH_INTERVAL_MS??60_000);
+  this.healthTimer=setInterval(()=>void this.healthCheck().catch(()=>{}),interval);
+  this.healthTimer.unref?.();
+  void this.healthCheck();
+ }
+ async healthCheck(){
+  const probeMs=Number(process.env.PATTY_HEALTH_PROBE_MS??5_000);
+  const accounts=this.store.accounts().filter(a=>a.state!=='removed');
+  await Promise.all(accounts.map(async account=>{
+   const adapter=this.adapters.get(account.id);
+   if(!adapter)return;
+   try{
+    await Promise.race([this.refreshAccount(account.id),new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('health_probe_timeout')),probeMs))]);
+   }catch(error){
+    logLine({event:'sub_health_check_failed',sub:account.alias,reason:(error as Error).message});
+    account.state='reconnect_required';
+    this.store.updateAccount(account);
+   }
+  }));
+ }
  async addCodexAccount(alias:string,mode:'browser'|'device_code'){const command=this.liveCodexCommand();if(!/^[a-z0-9-]{1,64}$/i.test(alias))throw new Error('invalid_request');if(this.store.accounts().some(account=>account.alias===alias))throw new Error('invalid_request');const root=privateDirectory(process.env.PATTY_ACCOUNT_HOME_ROOT??'.patty/accounts');const home=privateDirectory(join(root,alias));const adapter=new CodexAppServerAdapter(command,['app-server'],home,SUPPORTED_CODEX_VERSIONS.min,undefined,this.bridge);const account:Account={id:id('acct'),alias,tier:'primary',state:'pending_login',models:[],quota:{observedAt:now()},health:1,activeRuns:0};this.store.addAccount(account);this.homes.set(account.id,home);this.supervise(account.id,adapter);try{await adapter.start();const challenge=await adapter.login(mode);return {id:account.id,...challenge};}catch(error){this.adapters.delete(account.id);this.homes.delete(account.id);rmSync(home,{recursive:true,force:true});this.store.deleteAccountCascade(account.id);throw error;}}
  /**
   * A revoked ChatGPT login is not a new sub: the alias, its history and its isolated home all still
@@ -192,6 +215,7 @@ export class PattyDaemon { store:Store; router:Router; coordinator:Coordinator; 
  /** Every model name a caller may ask for is resolved once, at the edge, so routing, metering and the answer all name the model that actually ran. */
  resolveModel(model:string){return resolveModel(model,this.aliases,candidate=>this.store.accounts().some(account=>account.state!=='removed'&&account.models.includes(candidate)));}
  toolsServable(model:string){return this.store.accounts().some(account=>account.state!=='removed'&&account.models.includes(model)&&this.store.supports(account.id,['tools']));}
+ modelServable(model:string){return this.store.accounts().some(account=>account.state!=='removed'&&account.models.includes(model));}
  /** OpenAI-compatible chat completions, so any OpenAI client can drive the stack with `OPENAI_BASE_URL`. Routing, metering and failover are the same ones `/v1/runs` uses; `x-patty-sub` names the sub that served the request. */
  async chatCompletions(req:IncomingMessage,res:ServerResponse,requestId:string,apiKeyId:string,release:()=>void){return this.complete(await json(req) as ChatBody,res,requestId,apiKeyId,release,'chat');}
  /** The Responses API, which is what a current OpenAI or AI SDK client reaches for by default. It is a translation, not a second engine: the request becomes the same chat turn and only the answer is dressed differently. */
@@ -208,6 +232,8 @@ export class PattyDaemon { store:Store; router:Router; coordinator:Coordinator; 
   const model=this.resolveModel(body.model);
   /** Only a sub whose provider honours tools may serve a request offering them, and "nobody here can" is a permanent answer worth stating plainly instead of a routing failure the caller would retry. */
   if(tools?.length&&!this.toolsServable(model)){release();return write(res,400,{error:{code:'model_unavailable',message:`no stacked sub can serve tool calls for ${model}; stack an OpenAI-compatible sub to use tools`,requestId,retryable:false}});}
+  /** No sub has ever advertised this model, so waiting will not help. */
+  if(!this.modelServable(model)){release();throw new Error('no_eligible_account');}
   /** The verbatim messages always travel with the turn, so a provider that speaks roles keeps them and only a single-input provider falls back to the flattened prompt. */
   const chat:ChatTurn={messages:body.messages,...(tools?.length?{tools}:{}),...(tools?.length&&body.tool_choice!==undefined?{toolChoice:body.tool_choice as ChatTurn['toolChoice']}:{})};
   let responseFormat:ChatResponseFormat|undefined;try{responseFormat=parseResponseFormat(body.response_format);}catch(error){release();if(error instanceof InvalidSchemaError)return invalidSchemaResponse(res,error,requestId);return write(res,400,{error:{code:'invalid_request',message:invalidRequestMessage(error,'response_format must be text, json_object, or json_schema with a schema object'),requestId,retryable:false}});}
@@ -216,7 +242,15 @@ export class PattyDaemon { store:Store; router:Router; coordinator:Coordinator; 
   const resumed=this.resumeParkedRun(body.messages as ToolMessage[]);
   const stream=body.stream===true;
   if(resumed){release();return shape==='chat'?this.answer(res,resumed,model,stream,requestId,false):this.answerResponses(res,resumed,model,stream,requestId,false);}
-  const runId=await this.coordinator.start({model,input,chat,...(tools?.length?{capabilities:['tools']}:{}),...(instructions?{instructions}:{}),...(responseFormat?{responseFormat}:{}),...knobs},apiKeyId);
+  let runId:string|undefined;let lastError:unknown;
+  const queueMs=Number(process.env.PATTY_SUB_QUEUE_MS??10_000),tick=200;
+  const deadline=Date.now()+queueMs;
+  do{
+   try{runId=await this.coordinator.start({model,input,chat,...(tools?.length?{capabilities:['tools']}:{}),...(instructions?{instructions}:{}),...(responseFormat?{responseFormat}:{}),...knobs},apiKeyId);break;}
+   catch(error){if((error as Error)?.message!=='no_eligible_account'){release();throw error;}lastError=error;}
+   if(Date.now()+tick<deadline)await new Promise(r=>setTimeout(r,tick));
+  }while(Date.now()<deadline);
+  if(!runId){release();throw lastError??new Error('no_eligible_account');}
   this.releaseWhenSettled(runId,release);
   return shape==='chat'?this.answer(res,runId,model,stream,requestId,true):this.answerResponses(res,runId,model,stream,requestId,true);
  }
@@ -359,7 +393,7 @@ export class PattyDaemon { store:Store; router:Router; coordinator:Coordinator; 
   ];
   /** A missing Codex CLI is worth reporting but is not ill health: a stack of OpenAI-compatible or fake subs serves requests without one. A CLI that is present and unspeakable is, because every Codex login on the box is dead until it is fixed. */
   return {ok:checks.every(check=>check.ok||(check.check==='codex_cli'&&codexVersion===undefined)),checks:checks.map(({hint,...check})=>({...check,...(hint?{hint}:{})}))};}
- async shutdown(){await this.coordinator.shutdown();}
+ async shutdown(){if(this.healthTimer){clearInterval(this.healthTimer);this.healthTimer=undefined;}await this.coordinator.shutdown();}
  /** Loopback stays the default and the only unguarded option: a non-loopback bind exposes stacked
   * subscriptions to the network, so it requires an explicit opt-in and never a wildcard address. */
  static assertBindable(host:string,optedIn=process.env.PATTY_ALLOW_NON_LOOPBACK==='1'){
