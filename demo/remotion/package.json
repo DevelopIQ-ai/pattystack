@@ -1,0 +1,23 @@
+{
+  "name": "pattystack-remotion-demo",
+  "version": "1.0.0",
+  "description": "Terminal demo video for @puffle/pattystack",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "remotion studio src/index.ts",
+    "render:mp4": "remotion render src/index.ts TerminalDemo out/TerminalDemo.mp4",
+    "render:gif": "remotion render src/index.ts TerminalDemo out/TerminalDemo.gif --codec=gif --every-nth-frame=2"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.503",
+    "motion": "^12.43.0",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "remotion": "4.0.503"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.7",
+    "typescript": "5.9.3"
+  }
+}
